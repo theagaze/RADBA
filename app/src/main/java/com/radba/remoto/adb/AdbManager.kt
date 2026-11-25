@@ -16,6 +16,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -53,6 +54,9 @@ class AdbManager(context: Context) : Closeable {
     @Volatile
     private var rootHost: String? = null
     private val rootProbeLock = Mutex()
+
+    /** Disposing a live connection performs blocking socket I/O. */
+    private val closeScope = CoroutineScope(Dispatchers.IO)
 
     @Volatile
     private var monitorJob: Job? = null
@@ -100,10 +104,10 @@ class AdbManager(context: Context) : Closeable {
         }
     }
 
-    suspend fun reconnect(): Result<Unit> {
+    suspend fun reconnect(): Result<Unit> = withContext(Dispatchers.IO) {
         manager?.let { runCatching { it.disconnect() } }
         setOnline(false)
-        return connect(host.value)
+        connect(host.value)
     }
 
     fun startMonitor(scope: CoroutineScope, onStatus: (Boolean) -> Unit) {
@@ -230,9 +234,10 @@ class AdbManager(context: Context) : Closeable {
 
     fun cachedRootStatus(): RootStatus {
         val cached = rootStatus
-        return if (rootHost != host.value || cached.mode == null) {
-            RootStatus(null, null, cached.detail)
-        } else cached
+        if (rootHost != host.value || cached.available == null) {
+            return RootStatus(null, null, cached.detail)
+        }
+        return cached
     }
 
     suspend fun checkRoot(force: Boolean = false): RootStatus {
@@ -328,9 +333,15 @@ class AdbManager(context: Context) : Closeable {
 
     override fun close() {
         stopMonitor()
-        manager?.let { runCatching { it.close() } }
-        synchronized(instanceLock) { manager = null }
+        val connection = synchronized(instanceLock) {
+            val current = manager
+            manager = null
+            current
+        }
         setOnline(false)
+        if (connection != null) {
+            closeScope.launch { runCatching { connection.close() } }
+        }
     }
 
     private fun ensureManager(): RadbaAdbConnectionManager {

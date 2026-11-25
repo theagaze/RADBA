@@ -2,10 +2,10 @@ package com.radba.remoto.scrcpy
 
 import android.media.MediaCodec
 import android.media.MediaFormat
-import android.os.Build
 import android.view.Surface
 import kotlinx.coroutines.flow.MutableStateFlow
 import java.io.Closeable
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.util.ArrayDeque
 
@@ -52,6 +52,11 @@ class VideoDecoder : Closeable {
     private var mimeType: String = MediaFormat.MIMETYPE_VIDEO_AVC
 
     private val packets = ArrayDeque<EncodedPacket>()
+
+    /** Last SPS/PPS access unit, replayed whenever the codec is recreated. */
+    @Volatile
+    private var lastConfig: EncodedPacket? = null
+
     private val lock = Any()
     private var thread: Thread? = null
 
@@ -79,7 +84,7 @@ class VideoDecoder : Closeable {
         surfaceRef = surface
         surfaceGeneration++
         expectKeyFrame = true
-        synchronized(lock) { lock.notifyAll() }
+        synchronized(lock) { (lock as java.lang.Object).notifyAll() }
     }
 
     /** Drop non-intra frames until the next key frame (useful after reattach). */
@@ -94,10 +99,13 @@ class VideoDecoder : Closeable {
         val isKey = flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
         if (expectKeyFrame && !isConfig && !isKey) return
         if (isKey) expectKeyFrame = false
+        if (isConfig) {
+            synchronized(lock) { lastConfig = EncodedPacket(data.copyOf(), flags, ptsUs) }
+        }
         synchronized(lock) {
             if (packets.size >= MAX_PENDING) packets.removeFirst()
             packets.addLast(EncodedPacket(data.copyOf(), flags, ptsUs))
-            lock.notifyAll()
+            (lock as java.lang.Object).notifyAll()
         }
     }
 
@@ -105,13 +113,13 @@ class VideoDecoder : Closeable {
     fun signalEndOfStream() {
         if (closed) return
         endOfStream = true
-        synchronized(lock) { lock.notifyAll() }
+        synchronized(lock) { (lock as java.lang.Object).notifyAll() }
     }
 
     override fun close() {
         if (closed) return
         closed = true
-        synchronized(lock) { lock.notifyAll() }
+        synchronized(lock) { (lock as java.lang.Object).notifyAll() }
         val worker = thread
         worker?.interrupt()
         try {
@@ -146,9 +154,21 @@ class VideoDecoder : Closeable {
                     inputEosSent = false
                     configured.value = false
                     try {
-                        codec = createCodec(surfaceRef, width, height, mimeType)
+                        val newCodec = createCodec(surfaceRef, width, height, mimeType)
+                        codec = newCodec
                         configured.value = true
                         error.value = ""
+                        // scrcpy sends SPS/PPS only once; replay them so a codec
+                        // created after a surface change can decode immediately.
+                        lastConfig?.let { config ->
+                            try {
+                                enqueueWholePacket(newCodec, config)
+                            } catch (t: Throwable) {
+                                handleCodecFailure(t)
+                                releaseCodec(newCodec)
+                                codec = null
+                            }
+                        }
                     } catch (t: Throwable) {
                         configured.value = false
                         error.value = "Decoder: ${t.message ?: t::class.java.simpleName}"
@@ -173,30 +193,13 @@ class VideoDecoder : Closeable {
                     if (packets.isEmpty()) null else packets.removeFirst()
                 }
                 if (packet != null) {
-                    val index = try {
-                        activeCodec.dequeueInputBuffer(INPUT_TIMEOUT_US)
+                    try {
+                        enqueueWholePacket(activeCodec, packet)
                     } catch (t: Throwable) {
                         handleCodecFailure(t)
+                        synchronized(lock) { packets.addFirst(packet) }
                         releaseCodec(codec)
                         codec = null
-                        continue
-                    }
-                    if (index >= 0) {
-                        try {
-                            val buffer: ByteBuffer = activeCodec.getInputBuffer(index)
-                                ?: throw IllegalStateException("input buffer unavailable")
-                            buffer.clear()
-                            val count = minOf(packet.data.size, buffer.remaining())
-                            buffer.put(packet.data, 0, count)
-                            activeCodec.queueInputBuffer(index, 0, count, packet.ptsUs, packet.flags)
-                        } catch (t: Throwable) {
-                            handleCodecFailure(t)
-                            releaseCodec(codec)
-                            codec = null
-                        }
-                    } else {
-                        synchronized(lock) { packets.addFirst(packet) }
-                        waitForWork(1L)
                     }
                 } else if (endOfStream) {
                     val index = try {
@@ -235,6 +238,40 @@ class VideoDecoder : Closeable {
         }
     }
 
+    /**
+     * Queues a complete access unit, splitting it across input buffers when it
+     * is larger than the codec's maximum. Only the final chunk carries the
+     * original flags; earlier chunks are marked as partial frames.
+     */
+    private fun enqueueWholePacket(codec: MediaCodec, packet: EncodedPacket) {
+        var offset = 0
+        var stalled = 0
+        while (offset < packet.data.size) {
+            val index = codec.dequeueInputBuffer(INPUT_TIMEOUT_US)
+            if (index < 0) {
+                if (++stalled > MAX_ENQUEUE_ATTEMPTS) {
+                    throw IOException("codec sem buffers de entrada disponíveis")
+                }
+                waitForWork(1L)
+                continue
+            }
+            stalled = 0
+            val buffer: ByteBuffer = codec.getInputBuffer(index)
+                ?: throw IllegalStateException("input buffer unavailable")
+            buffer.clear()
+            val chunk = minOf(packet.data.size - offset, buffer.remaining())
+            if (chunk <= 0) throw IllegalStateException("input buffer vazio")
+            buffer.put(packet.data, offset, chunk)
+            offset += chunk
+            val flags = if (offset >= packet.data.size) {
+                packet.flags
+            } else {
+                packet.flags or MediaCodec.BUFFER_FLAG_PARTIAL_FRAME
+            }
+            codec.queueInputBuffer(index, 0, chunk, packet.ptsUs, flags)
+        }
+    }
+
     private fun drainOutput(codec: MediaCodec): Boolean {
         val info = MediaCodec.BufferInfo()
         var reachedEos = false
@@ -250,15 +287,17 @@ class VideoDecoder : Closeable {
                 MediaCodec.INFO_OUTPUT_FORMAT_CHANGED, MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> continue
                 else -> {
                     if (index < 0) return reachedEos
-                    val configOnly = info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
-                    val render = !closed && surfaceRef != null && !configOnly && info.size > 0
+                    val configOnly = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                    val isFrame = !configOnly &&
+                        (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) == 0
+                    val render = !closed && surfaceRef != null && isFrame
                     try {
                         codec.releaseOutputBuffer(index, render)
                     } catch (t: Throwable) {
                         handleCodecFailure(t)
                         return reachedEos
                     }
-                    if (!configOnly && info.size > 0 && !firstFrame.value) firstFrame.value = true
+                    if (render && !firstFrame.value) firstFrame.value = true
                     if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) reachedEos = true
                 }
             }
@@ -270,24 +309,13 @@ class VideoDecoder : Closeable {
         val format = MediaFormat.createVideoFormat(mime, width, height).apply {
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_INPUT_SIZE)
         }
-        var codec = MediaCodec.createDecoderByType(mime)
+        val codec = MediaCodec.createDecoderByType(mime)
         try {
             codec.configure(format, surface, null, 0)
             codec.start()
             return codec
         } catch (t: Throwable) {
             releaseCodec(codec)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                codec = MediaCodec.createDecoderByType(mime)
-                try {
-                    codec.configure(format, surface, null, MediaCodec.CONFIGURE_FLAG_USE_BLOCK_MODEL)
-                    codec.start()
-                    return codec
-                } catch (blockFailure: Throwable) {
-                    releaseCodec(codec)
-                    throw blockFailure
-                }
-            }
             throw t
         }
     }
@@ -300,7 +328,7 @@ class VideoDecoder : Closeable {
         if (closed) return
         synchronized(lock) {
             try {
-                lock.wait(timeoutMs)
+                (lock as java.lang.Object).wait(timeoutMs)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
@@ -328,5 +356,6 @@ class VideoDecoder : Closeable {
         const val OUTPUT_TIMEOUT_US = 2_000L
         const val MAX_INPUT_SIZE = 8 * 1024 * 1024
         const val MAX_PENDING = 48
+        const val MAX_ENQUEUE_ATTEMPTS = 5_000
     }
 }

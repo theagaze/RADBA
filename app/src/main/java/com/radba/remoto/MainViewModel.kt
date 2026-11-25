@@ -53,6 +53,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
@@ -493,6 +494,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         scrcpy.setViewSize(width, height)
     }
 
+    /** Restore the mirror when safe; surface callbacks must not force a restart. */
+    fun ensureMirror() {
+        safeLaunch { ensureMirrorInternal() }
+    }
+
     private suspend fun ensureMirrorInternal() {
         val state = _ui.value
         if (state.tab != Tab.HOME || !state.prefs.mirror || !adb.online.value) return
@@ -638,7 +644,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         safeLaunch {
             try {
                 val bytes = if (adb.online.value) runCatching { services.screenshot() }.getOrNull() else null
-                val bitmap = if (!bytes.isNullOrEmpty()) {
+                val bitmap = if (bytes != null && bytes.isNotEmpty()) {
                     runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }.getOrNull()
                 } else {
                     null
@@ -699,8 +705,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun applyVdim(pct: Int, warm: Int) {
         coalesce("vdim") {
-            val result = runCatching { services.applyVirtualBrightness(pct, warm) }
-            val failure = result.exceptionOrNull()
+            val failure = try {
+                services.applyVirtualBrightness(pct, warm).exceptionOrNull()
+            } catch (t: Throwable) {
+                t
+            }
             if (failure != null) {
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastVdimErrorMs > 10_000L) {
@@ -781,12 +790,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _ui.update { it.copy(rootStatus = status) }
         if (status.available != true) return
         val current = prefsFlow.value
-        if (current.rootFixVideo) {
-            runCatching { applyVideoFixInternal(disable = true) }
-        }
-        if (current.vBright < 100 || current.vWarm > 0) {
-            runCatching { services.applyVirtualBrightness(current.vBright, current.vWarm) }
-        }
+        // Always reapply: a previous session may have left SurfaceFlinger
+        // overridden even when the saved preferences are back at defaults.
+        runCatching { applyVideoFixInternal(disable = current.rootFixVideo) }
+        runCatching { services.applyVirtualBrightness(current.vBright, current.vWarm) }
     }
 
     fun testRoot() {
@@ -809,10 +816,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _ui.update { it.copy(rootStatus = status) }
             if (status.available == true) {
                 val current = prefsFlow.value
-                if (current.rootFixVideo) runCatching { applyVideoFixInternal(disable = true) }
-                if (current.vBright < 100 || current.vWarm > 0) {
-                    runCatching { services.applyVirtualBrightness(current.vBright, current.vWarm) }
-                }
+                runCatching { applyVideoFixInternal(disable = current.rootFixVideo) }
+                runCatching { services.applyVirtualBrightness(current.vBright, current.vWarm) }
             }
         }
     }
@@ -875,8 +880,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _ui.update { it.copy(prefs = it.prefs.copy(videoEncoder = encoder)) }
         }
         val label = encoderLabel(encoder)
-        toast("Encoder: $label · reiniciando espelho…", ToastKind.INFO)
-        if (adb.online.value) startMirror()
+        val restart = adb.online.value && _ui.value.mirrorState == MirrorState.ON
+        toast(
+            "Encoder: $label${if (restart) " · reiniciando espelho…" else " · aplicado ao próximo espelho"}",
+            ToastKind.INFO,
+        )
+        if (restart) startMirror()
     }
 
     fun setFpsMode(mode: String) {
@@ -1456,6 +1465,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         val hostCommand = raw.startsWith("!")
         val body = if (hostCommand) raw.drop(1).trim() else raw
+        if (hostCommand) {
+            appendTerminal("${'$'} !" + if (body.isEmpty()) "" else " $body", TerminalKind.COMMAND)
+            appendTerminal("! comandos do PC não são suportados no Android.", TerminalKind.ERROR)
+            _ui.update { it.copy(terminalBusy = false) }
+            return
+        }
         val lines = body.lineSequence()
             .map { cleanTerminalLine(it) }
             .filter { it.isNotEmpty() }
@@ -1467,13 +1482,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         safeLaunch {
             try {
-                val commands = if (hostCommand) listOf(lines.first()) else lines
-                for (line in commands) {
-                    appendTerminal(("${'$'} " + (if (hostCommand) "! " else "")) + line, TerminalKind.COMMAND)
-                    if (hostCommand) {
-                        appendTerminal("! comandos do PC não são suportados no Android.", TerminalKind.ERROR)
-                        continue
-                    }
+                for (line in lines) {
+                    appendTerminal("${'$'} $line", TerminalKind.COMMAND)
                     if (!adb.online.value) {
                         appendTerminal("Projetor desconectado: sem resposta do adb.", TerminalKind.ERROR)
                         break

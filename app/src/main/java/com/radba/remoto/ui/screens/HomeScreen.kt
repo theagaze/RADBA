@@ -1,11 +1,13 @@
 package com.radba.remoto.ui.screens
 
+import android.graphics.SurfaceTexture
 import android.os.SystemClock
 import android.view.Surface
-import android.view.SurfaceTexture
 import android.view.TextureView
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,9 +36,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
-import androidx.compose.ui.input.pointer.awaitEachGesture
-import androidx.compose.ui.input.pointer.awaitFirstDown
-import androidx.compose.ui.input.pointer.awaitPointerEventScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
@@ -137,7 +136,7 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                                     mirrorSurface = Surface(surfaceTexture)
                                     viewModel.attachMirrorSurface(mirrorSurface)
                                     viewModel.updateMirrorView(width, height)
-                                    viewModel.startMirror()
+                                    viewModel.ensureMirror()
                                 }
                             }
 
@@ -148,7 +147,7 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                             ) {
                                 runCatching {
                                     viewModel.updateMirrorView(width, height)
-                                    viewModel.startMirror()
+                                    viewModel.ensureMirror()
                                 }
                             }
 

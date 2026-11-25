@@ -163,7 +163,9 @@ class DeviceServices(private val adb: AdbManager) {
         if (direct.isPng()) return direct
 
         val shellRaw = readStreamToBytes(adb, "shell:screencap -p", 25_000) ?: return null
-        val withoutExit = shellStripExitCode(shellRaw).data
+        // Some adbd builds translate LF to CRLF on `shell:`, which corrupts the
+        // PNG payload while leaving its magic bytes intact.
+        val withoutExit = shellStripExitCode(normalizeCrLf(shellRaw)).data
         if (withoutExit.isPng()) return withoutExit
 
         if (withoutExit.size > 4) {
@@ -297,4 +299,25 @@ private fun ByteArray?.isPng(): Boolean {
         if (this[index] != PNG_MAGIC[index]) return false
     }
     return true
+}
+
+private fun normalizeCrLf(bytes: ByteArray): ByteArray {
+    var count = 0
+    for (index in 0 until bytes.size - 1) {
+        if (bytes[index] == 13.toByte() && bytes[index + 1] == 10.toByte()) count++
+    }
+    if (count == 0) return bytes
+    val result = ByteArray(bytes.size - count)
+    var source = 0
+    var target = 0
+    while (source < bytes.size) {
+        if (source + 1 < bytes.size &&
+            bytes[source] == 13.toByte() && bytes[source + 1] == 10.toByte()
+        ) {
+            source += 2
+        } else {
+            result[target++] = bytes[source++]
+        }
+    }
+    return result
 }

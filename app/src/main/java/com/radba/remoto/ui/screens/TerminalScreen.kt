@@ -15,6 +15,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -37,6 +38,9 @@ fun TerminalScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
     val clipboard = LocalClipboardManager.current
     var copied by remember { mutableStateOf(false) }
     val scrollState = rememberScrollState()
+    LaunchedEffect(state.terminalLines.size) {
+        scrollState.scrollTo(scrollState.maxValue)
+    }
 
     Column(
         modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 10.dp),
@@ -71,7 +75,7 @@ fun TerminalScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
             modifier = Modifier
                 .fillMaxWidth()
                 .onKeyEvent { event ->
-                    when (event.nativeEvent.keyCode) {
+                    when (event.nativeKeyEvent.keyCode) {
                         android.view.KeyEvent.KEYCODE_DPAD_UP -> {
                             viewModel.terminalHistoryUp()
                             true

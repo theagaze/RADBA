@@ -41,6 +41,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -57,6 +58,7 @@ private fun Modifier.glassGlow(accent: Color): Modifier = this.then(
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         Modifier.graphicsLayer {
             renderEffect = RenderEffect.createBlurEffect(20f, 20f, Shader.TileMode.CLAMP)
+                .asComposeRenderEffect()
         }
     } else {
         Modifier

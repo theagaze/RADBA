@@ -170,7 +170,7 @@ class PqController(context: Context, private val adb: AdbManager) : Closeable {
             stop()
             throw IOException("tvctl não iniciou")
         }
-        while (channel.poll() != null) {
+        while (channel.tryReceive().getOrNull() != null) {
             // Discard lines left over from the startup handshake.
         }
     }

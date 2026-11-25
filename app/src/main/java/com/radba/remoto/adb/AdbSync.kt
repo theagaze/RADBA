@@ -8,6 +8,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -63,24 +64,31 @@ internal object AdbSync {
         }
 
     suspend fun pull(adb: AdbManager, path: String, local: File) = withSyncStream(adb) { stream ->
-        sendRequest(stream, "RECV", path.toByteArray(StandardCharsets.UTF_8))
-        val output = ByteArrayOutputStream()
-        while (true) {
-            val header = readPacketHeader(stream)
-                ?: throw IOException("sem resposta do ADB ao ler $path")
-            when (header.id) {
-                "DATA" -> {
-                    val payload = readExact(stream, header.value)
-                        ?: throw IOException("dados truncados ao ler $path")
-                    output.write(payload)
-                }
-                "DONE" -> break
-                "FAIL" -> throw IOException(readFailure(stream, header.value, "falha ao ler $path"))
-                else -> throw IOException("resposta inesperada do ADB: ${header.id}")
-            }
+        val parent = local.parentFile
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw IOException("não foi possível criar ${parent.absolutePath}")
         }
-        local.parentFile?.let { if (!it.exists()) it.mkdirs() }
-        local.writeBytes(output.toByteArray())
+        // Stream DATA packets straight to disk: buffering a whole remote file
+        // in memory can exhaust the heap on large videos or logs.
+        FileOutputStream(local).use { output ->
+            sendRequest(stream, "RECV", path.toByteArray(StandardCharsets.UTF_8))
+            var done = false
+            while (!done) {
+                val header = readPacketHeader(stream)
+                    ?: throw IOException("sem resposta do ADB ao ler $path")
+                when (header.id) {
+                    "DATA" -> {
+                        val payload = readExact(stream, header.value)
+                            ?: throw IOException("dados truncados ao ler $path")
+                        output.write(payload)
+                    }
+                    "DONE" -> done = true
+                    "FAIL" -> throw IOException(readFailure(stream, header.value, "falha ao ler $path"))
+                    else -> throw IOException("resposta inesperada do ADB: ${header.id}")
+                }
+            }
+            output.flush()
+        }
     }
 
     suspend fun list(adb: AdbManager, path: String): List<FileEntry> = withSyncStream(adb) { stream ->

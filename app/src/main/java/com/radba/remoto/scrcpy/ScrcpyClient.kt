@@ -25,7 +25,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.File
@@ -241,7 +241,7 @@ class ScrcpyClient(
         if (!isReady()) return false
         val buffer = ByteBuffer.allocate(2).order(ByteOrder.BIG_ENDIAN)
         buffer.put(TYPE_POWER.toByte())
-        buffer.put((if (on) 1 else 0).toByte())
+        buffer.put((if (on) POWER_MODE_NORMAL else POWER_MODE_OFF).toByte())
         return enqueue(buffer.array())
     }
 
@@ -273,7 +273,11 @@ class ScrcpyClient(
         fps: Int,
         onProgress: ((String) -> Unit)?,
     ) {
-        val scid = UUID.randomUUID().toString().replace("-", "").take(8)
+        // scrcpy parses scid with Integer.parseInt(value, 16), so it must be a
+        // positive 31-bit value. Derive both the command and the socket name
+        // from the same number so they always match.
+        val scidValue = (UUID.randomUUID().mostSignificantBits and 0x7fff_ffffL).toInt()
+        val scid = "%08x".format(scidValue)
         val command = buildServerCommand(prefs, encoder, software, scid, fps)
         synchronized(logLock) { serverLog.setLength(0) }
         serverEnded = false
@@ -314,11 +318,12 @@ class ScrcpyClient(
         videoDecoder.configure(surfaceRef, width, height)
         videoJob = scope.launch(Dispatchers.IO) { readVideo(token, streams.first, videoDecoder) }
 
-        withTimeout(FIRST_FRAME_TIMEOUT_MS) {
+        val firstFrame = withTimeoutOrNull(FIRST_FRAME_TIMEOUT_MS) {
             combine(videoDecoder.configured, videoDecoder.firstFrame) { configured, frame ->
                 configured && frame
             }.first { it }
         }
+        if (firstFrame != true) throw IOException("nenhum frame recebido")
     }
 
     private suspend fun openStreams(
@@ -344,7 +349,11 @@ class ScrcpyClient(
             val videoStream = video ?: throw IOException("tempo esgotado ao abrir o stream de vídeo")
 
             // scrcpy sends one dummy byte on accept so connection errors surface here.
-            readFully(videoStream, ByteArray(1), 0, 1, token)
+            val dummy = ByteArray(1)
+            val dummyRead = withTimeoutOrNull(STREAM_TIMEOUT_MS) {
+                readFully(videoStream, dummy, 0, 1, token)
+            }
+            if (dummyRead == null) throw IOException("tempo esgotado no handshake de vídeo")
             onProgress?.invoke("Vídeo conectado; abrindo controle…")
 
             while (control == null && System.currentTimeMillis() < deadline) {
@@ -361,7 +370,10 @@ class ScrcpyClient(
 
             // 64-byte device name + codecId/width/height, all big endian.
             val meta = ByteArray(76)
-            readFully(videoStream, meta, 0, meta.size, token)
+            val metaRead = withTimeoutOrNull(STREAM_TIMEOUT_MS) {
+                readFully(videoStream, meta, 0, meta.size, token)
+            }
+            if (metaRead == null) throw IOException("tempo esgotado ao ler metadados de vídeo")
             val width = ByteBuffer.wrap(meta, 68, 4).order(ByteOrder.BIG_ENDIAN).int
             val height = ByteBuffer.wrap(meta, 72, 4).order(ByteOrder.BIG_ENDIAN).int
             if (width <= 0 || height <= 0) {
@@ -736,6 +748,8 @@ class ScrcpyClient(
         const val TYPE_TEXT = 1
         const val TYPE_TOUCH = 2
         const val TYPE_POWER = 10
+        const val POWER_MODE_OFF = 0
+        const val POWER_MODE_NORMAL = 2
         const val ACTION_DOWN = 0
         const val ACTION_UP = 1
         const val ACTION_MOVE = 2
