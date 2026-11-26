@@ -14,13 +14,13 @@ import io.github.muntashirakon.adb.AdbStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
@@ -48,7 +48,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.CoroutineContext
-import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
 import kotlin.math.min
 
@@ -119,9 +118,9 @@ class ScrcpyClient(
     @Volatile private var displayOff = false
 
     fun attachSurface(surface: Surface?) {
+        decoder?.attachSurface(surface)
         surfaceRef = surface
         surfaceReady.value = surface != null
-        decoder?.attachSurface(surface)
     }
 
     /** Keep scrcpy from waking a display that the app intentionally blacked out. */
@@ -180,8 +179,10 @@ class ScrcpyClient(
                 )
                 try {
                     val launched = withTimeoutOrNull(SESSION_START_TIMEOUT_MS) {
-                        launchSession(token, tier, encoder, software, onProgress)
-                        true
+                        adb.withCritical {
+                            launchSession(token, tier, encoder, software, onProgress)
+                            true
+                        }
                     }
                     if (launched != true) throw IOException("tempo esgotado ao iniciar a sessão de vídeo")
                     if (token != generation) return false
@@ -260,6 +261,13 @@ class ScrcpyClient(
             tierName = tier.name,
         )
         if (!isReady()) return 0
+        if (!surfaceReady.value) {
+            // No TextureView attached: frame timestamps are intentionally idle,
+            // so freeze both adaptation timers until the surface comes back.
+            lowSinceMs = 0L
+            goodSinceMs = 0L
+            return 0
+        }
         val now = SystemClock.elapsedRealtime()
         if (now - lastAdaptMs < ADAPT_COOLDOWN_MS) return 0
 
@@ -579,22 +587,28 @@ class ScrcpyClient(
         stream: AdbStream,
         timeoutMs: Long,
         block: suspend () -> T,
-    ): T? = coroutineScope {
+    ): T? = withContext(Dispatchers.IO) {
         val budget = timeoutMs.coerceAtLeast(1L)
-        val completed = AtomicBoolean(false)
-        val watchdog = launch(Dispatchers.IO) {
+        val finished = CompletableDeferred<Unit>()
+        val expired = AtomicBoolean(false)
+        val watchdogScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val watchdog = watchdogScope.launch {
             delay(budget)
-            if (!completed.get()) closeStream(stream)
+            if (!finished.isCompleted) {
+                expired.set(true)
+                closeStream(stream)
+            }
         }
         try {
-            withTimeoutOrNull(budget) {
-                val result = block()
-                completed.set(true)
-                result
-            }
+            val value = block()
+            if (expired.get()) null else value
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            if (expired.get()) null else throw t
         } finally {
-            completed.set(true)
+            finished.complete(Unit)
             watchdog.cancel()
+            watchdogScope.cancel()
         }
     }
 
@@ -690,10 +704,12 @@ class ScrcpyClient(
 
     /** Serialize asset extraction and push so video/control starts cannot interleave. */
     private suspend fun prepareAndPushJar(onProgress: ((String) -> Unit)?) = jarLock.withLock {
-        val jar = withTimeoutOrNull(30_000L) { prepareServerJar(onProgress) }
-            ?: throw IOException("tempo esgotado ao preparar o servidor scrcpy")
-        val pushed = withTimeoutOrNull(20_000L) { pushJarIfNeeded(jar, onProgress) }
-        if (pushed == null) throw IOException("tempo esgotado ao enviar o servidor scrcpy")
+        adb.withCritical {
+            val jar = withTimeoutOrNull(30_000L) { prepareServerJar(onProgress) }
+                ?: throw IOException("tempo esgotado ao preparar o servidor scrcpy")
+            val pushed = withTimeoutOrNull(40_000L) { pushJarIfNeeded(jar, onProgress) }
+            if (pushed == null) throw IOException("tempo esgotado ao enviar o servidor scrcpy")
+        }
     }
 
     private suspend fun prepareServerJar(onProgress: ((String) -> Unit)?) = withContext(Dispatchers.IO) {
@@ -755,10 +771,8 @@ class ScrcpyClient(
 
     private suspend fun pushJarIfNeeded(jar: ByteArray, onProgress: ((String) -> Unit)?) =
         withContext(Dispatchers.IO) {
-            val remoteSize = adb.remoteFileSize(REMOTE_JAR)
-            if (remoteSize == jar.size.toLong()) return@withContext
             onProgress?.invoke("Enviando servidor para o dispositivo…")
-            val result = adb.pushBytes(jar, REMOTE_JAR)
+            val result = adb.pushBytesViaShell(jar, REMOTE_JAR)
             if (result.isFailure) {
                 throw IOException(
                     "falha ao enviar servidor: ${result.exceptionOrNull()?.message ?: "erro desconhecido"}",
@@ -766,15 +780,15 @@ class ScrcpyClient(
             }
         }
 
-    private suspend fun applyRootFixes(onProgress: ((String) -> Unit)?) {
+    private suspend fun applyRootFixes(onProgress: ((String) -> Unit)?) = adb.withCritical {
         val host = adb.host.value
-        if (rootFixesHost == host) return
+        if (rootFixesHost == host) return@withCritical
         // Do not spend the startup budget probing su on a device that is not
         // already known to be rooted. The mirror works without these tweaks.
         if (adb.cachedRootStatus().available != true) {
             onProgress?.invoke("Sem root confirmado; ajustes de vídeo ignorados")
             rootFixesHost = host
-            return
+            return@withCritical
         }
         // All privileged commands share the outer startup budget so a slow media
         // restart cannot consume the whole session timeout.
@@ -784,7 +798,7 @@ class ScrcpyClient(
 
         onProgress?.invoke("Aplicando ajustes de vídeo (root)…")
         val surfaceFix = runPrivileged("service call SurfaceFlinger 1008 i32 1", budget(5_000L))
-        if (!surfaceFix.ok) return
+        if (!surfaceFix.ok) return@withCritical
         val property = runPrivileged("getprop vendor.media.c2.vdec.support", budget(4_000L))
         if (property.stdout.trim() != "false") {
             runPrivileged(
@@ -818,6 +832,7 @@ class ScrcpyClient(
                 val types = method.parameterTypes
                 val isSuspend = types.lastOrNull() == Continuation::class.java
                 val deferred = CompletableDeferred<Any?>()
+                val callerContext = currentCoroutineContext()
                 val arguments = ArrayList<Any?>(types.size)
                 for (type in types) {
                     when {
@@ -826,7 +841,7 @@ class ScrcpyClient(
                             arguments.add(timeoutMs)
                         isSuspend && type == Continuation::class.java ->
                             arguments.add(object : Continuation<Any?> {
-                                override val context: CoroutineContext = EmptyCoroutineContext
+                                override val context: CoroutineContext = callerContext
                                 override fun resumeWith(result: Result<Any?>) {
                                     if (result.isFailure) {
                                         deferred.completeExceptionally(
@@ -956,66 +971,68 @@ class ScrcpyClient(
         if (!ctlStarting.compareAndSet(false, true)) return false
         val token = ++ctlGeneration
         try {
-            teardownControl()
-            prepareAndPushJar(null)
-            val scid = "%08x".format((UUID.randomUUID().mostSignificantBits and 0x7fff_ffffL).toInt())
-            val command = StringBuilder(
-                "CLASSPATH=$REMOTE_JAR app_process / com.genymobile.scrcpy.Server $SERVER_VERSION " +
-                    "scid=$scid log_level=info tunnel_forward=true control=true video=false audio=false " +
-                    "cleanup=false clipboard_autosync=false send_device_meta=false send_dummy_byte=true",
-            )
-            if (displayOff) command.append(" power_on=false")
-            adb.shell("pkill -f 'com.genymobile.scrcpy.Serve[r].* video=false' 2>/dev/null; echo ok", 8_000L)
-            val shell = withContext(Dispatchers.IO) { adb.openStream("shell:$command") }
-            ctlShell = shell
-            ctlJob = scope.launch(Dispatchers.IO) {
-                val buffer = ByteArray(2048)
-                try {
-                    while (isActive && !shell.isClosed) {
-                        if (shell.read(buffer, 0, buffer.size) <= 0) break
-                    }
-                } catch (_: Throwable) {
-                    // output is not needed; only the end of the server matters
-                } finally {
-                    if (token == ctlGeneration) {
-                        ctlReady = false
-                        ctlRetryAfterMs = SystemClock.elapsedRealtime() + 10_000L
-                    }
-                }
-            }
-            val destination = "localabstract:scrcpy_$scid"
-            val deadline = System.currentTimeMillis() + STREAM_TIMEOUT_MS
-            var stream: AdbStream? = null
-            while (stream == null && System.currentTimeMillis() < deadline) {
-                if (token != ctlGeneration) {
-                    closeStream(stream)
-                    throw CancellationException("controle interrompido")
-                }
-                if (shell.isClosed) throw IOException("servidor de controle encerrado")
-                try {
-                    stream = adb.openStream(destination)
-                } catch (t: Throwable) {
-                    if (t is CancellationException) throw t
-                    delay(80L)
-                }
-            }
-            val control = stream ?: throw IOException("tempo esgotado ao abrir o controle")
-            val dummy = ByteArray(1)
-            val got = withStreamGuard(control, (deadline - System.currentTimeMillis()).coerceAtLeast(1L)) {
-                withContext(Dispatchers.IO) { control.read(dummy, 0, 1) }
-            }
-            if (got == null || got <= 0) {
-                closeStream(control)
-                throw IOException("tempo esgotado no handshake de controle")
-            }
-            if (token != ctlGeneration || !adb.online.value || ctlJob?.isActive != true) {
-                closeStream(control)
+            adb.withCritical {
                 teardownControl()
-                return false
+                prepareAndPushJar(null)
+                val scid = "%08x".format((UUID.randomUUID().mostSignificantBits and 0x7fff_ffffL).toInt())
+                val command = StringBuilder(
+                    "CLASSPATH=$REMOTE_JAR app_process / com.genymobile.scrcpy.Server $SERVER_VERSION " +
+                        "scid=$scid log_level=info tunnel_forward=true control=true video=false audio=false " +
+                        "cleanup=false clipboard_autosync=false send_device_meta=false send_dummy_byte=true",
+                )
+                if (displayOff) command.append(" power_on=false")
+                adb.shell("pkill -f 'com.genymobile.scrcpy.Serve[r].* video=false' 2>/dev/null; echo ok", 8_000L)
+                val shell = withContext(Dispatchers.IO) { adb.openStream("shell:$command") }
+                ctlShell = shell
+                ctlJob = scope.launch(Dispatchers.IO) {
+                    val buffer = ByteArray(2048)
+                    try {
+                        while (isActive && !shell.isClosed) {
+                            if (shell.read(buffer, 0, buffer.size) <= 0) break
+                        }
+                    } catch (_: Throwable) {
+                        // output is not needed; only the end of the server matters
+                    } finally {
+                        if (token == ctlGeneration) {
+                            ctlReady = false
+                            ctlRetryAfterMs = SystemClock.elapsedRealtime() + 10_000L
+                        }
+                    }
+                }
+                val destination = "localabstract:scrcpy_$scid"
+                val deadline = System.currentTimeMillis() + STREAM_TIMEOUT_MS
+                var stream: AdbStream? = null
+                while (stream == null && System.currentTimeMillis() < deadline) {
+                    if (token != ctlGeneration) {
+                        closeStream(stream)
+                        throw CancellationException("controle interrompido")
+                    }
+                    if (shell.isClosed) throw IOException("servidor de controle encerrado")
+                    try {
+                        stream = adb.openStream(destination)
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                        delay(80L)
+                    }
+                }
+                val control = stream ?: throw IOException("tempo esgotado ao abrir o controle")
+                val dummy = ByteArray(1)
+                val got = withStreamGuard(control, (deadline - System.currentTimeMillis()).coerceAtLeast(1L)) {
+                    withContext(Dispatchers.IO) { control.read(dummy, 0, 1) }
+                }
+                if (got == null || got <= 0) {
+                    closeStream(control)
+                    throw IOException("tempo esgotado no handshake de controle")
+                }
+                if (token != ctlGeneration || !adb.online.value || ctlJob?.isActive != true) {
+                    closeStream(control)
+                    teardownControl()
+                    return@withCritical false
+                }
+                ctlStream = control
+                ctlReady = true
+                return@withCritical true
             }
-            ctlStream = control
-            ctlReady = true
-            return true
         } catch (t: Throwable) {
             teardownControl()
             if (t is CancellationException) throw t

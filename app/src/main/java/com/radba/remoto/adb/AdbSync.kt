@@ -3,7 +3,10 @@ package com.radba.remoto.adb
 import com.radba.remoto.data.FileEntry
 import io.github.muntashirakon.adb.AdbStream
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -143,7 +146,8 @@ internal suspend fun readStreamToBytes(
         return@withContext null
     }
     val expired = AtomicBoolean(false)
-    val watchdog = launch {
+    val watchdogScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    val watchdog = watchdogScope.launch {
         delay(timeoutMs.coerceAtLeast(1L))
         expired.set(true)
         closeQuietly(stream)
@@ -162,6 +166,7 @@ internal suspend fun readStreamToBytes(
         // The daemon closes the stream at EOF or the watchdog cancels a slow read.
     } finally {
         watchdog.cancel()
+        watchdogScope.cancel()
         closeQuietly(stream)
     }
     if (expired.get()) null else output.toByteArray()
@@ -177,7 +182,8 @@ private suspend fun <T> withSyncStream(
     block: suspend (AdbStream) -> T,
 ): T = withContext(Dispatchers.IO) {
     val stream = adb.openStream("sync:")
-    val watchdog = launch {
+    val watchdogScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    val watchdog = watchdogScope.launch {
         delay(SYNC_TIMEOUT_MS)
         closeQuietly(stream)
     }
@@ -185,6 +191,7 @@ private suspend fun <T> withSyncStream(
         block(stream)
     } finally {
         watchdog.cancel()
+        watchdogScope.cancel()
         closeQuietly(stream)
     }
 }

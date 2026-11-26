@@ -19,6 +19,7 @@ import com.radba.remoto.data.AppMeta
 import com.radba.remoto.data.AppPreferences
 import com.radba.remoto.data.ConnectionState
 import com.radba.remoto.data.DeviceInfo
+import com.radba.remoto.data.ErrorLogEntry
 import com.radba.remoto.data.FileEntry
 import com.radba.remoto.data.MirrorState
 import com.radba.remoto.data.PerfStats
@@ -73,6 +74,7 @@ private val DISPLAY_SIZE_REGEX = Regex("""(\d+)\s*[xX]\s*(\d+)""")
 private const val TOUCH_HOVER = 7
 private const val MIRROR_START_TIMEOUT_MS = 210_000L
 private const val MIRROR_NO_FRAME_TIMEOUT_MS = 12_000L
+private const val ERROR_LOG_LIMIT = 40
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     data class UiState(
@@ -89,6 +91,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val filesPath: String = "/sdcard",
         val files: List<FileEntry> = emptyList(),
         val settingsNote: SettingsNote? = null,
+        val errorLog: List<ErrorLogEntry> = emptyList(),
         val volumePct: Int = 100,
         val volumeMax: Int = 15,
         val terminalLines: List<TerminalLine> = emptyList(),
@@ -226,6 +229,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             scrcpy.error.collect { error ->
                 if (error.isNotBlank()) {
                     _ui.update { it.copy(mirrorError = error) }
+                    logProblem("scrcpy: ${trunc(error, 220)}")
                 }
             }
         }
@@ -277,17 +281,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // ------------------------------------------------------------ infra --
 
-    private fun toast(text: String, kind: ToastKind = ToastKind.INFO) {
+    private fun toast(text: String, kind: ToastKind = ToastKind.INFO, logError: Boolean = true) {
         _toasts.tryEmit(ToastMessage(text, kind))
+        if (kind == ToastKind.ERROR && logError) logProblem(text)
     }
 
-    private fun note(text: String, kind: ToastKind = ToastKind.INFO) {
+    private fun note(text: String, kind: ToastKind = ToastKind.INFO, logError: Boolean = true) {
         _ui.update { it.copy(settingsNote = SettingsNote(text, kind)) }
+        if (kind == ToastKind.ERROR && logError) logProblem(text)
     }
 
     private fun noteAndToast(text: String, kind: ToastKind) {
-        note(text, kind)
-        toast(text, kind)
+        note(text, kind, logError = false)
+        toast(text, kind, logError = false)
+        if (kind == ToastKind.ERROR) logProblem(text)
+    }
+
+    /** Error-only diagnostic ring. Repeated messages are collapsed with a counter. */
+    private fun logProblem(raw: String) {
+        if (!_ui.value.prefs.verboseErrors) return
+        val message = trunc(raw.trim(), 220)
+        if (message.isBlank()) return
+        val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        _ui.update { state ->
+            val existing = state.errorLog.firstOrNull { it.text == message }
+            val updated = if (existing != null) {
+                state.errorLog.filterNot { it.text == message } +
+                    existing.copy(time = time, count = existing.count + 1)
+            } else {
+                state.errorLog + ErrorLogEntry(time, message)
+            }
+            state.copy(errorLog = updated.takeLast(ERROR_LOG_LIMIT))
+        }
     }
 
     private fun safeLaunchJob(block: suspend () -> Unit): Job = viewModelScope.launch {
@@ -344,6 +369,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             handleOnline(true)
         } else {
             val message = result.exceptionOrNull()?.message.orEmpty()
+            if (!showMessages) {
+                logProblem("Não conectou em ${adb.host.value}: ${trunc(message.ifBlank { "sem resposta" }, 140)}")
+            }
             if (showMessages) {
                 if (message.contains("unauthorized", ignoreCase = true)) {
                     note("Autorize a depuração na tela do aparelho.", ToastKind.ERROR)
@@ -354,7 +382,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             "(no Android 11+ use 'Parear' antes)",
                         ToastKind.ERROR,
                     )
-                    toast("Não conectou.", ToastKind.ERROR)
+                    toast("Não conectou.", ToastKind.ERROR, logError = false)
                 }
             }
             handleOnline(false)
@@ -390,6 +418,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (!_ui.value.prefs.mirror) refreshScreenshot()
             }
         } else {
+            if (!reconnecting.get()) logProblem("Conexão ADB perdida")
             scrcpy.stop()
             scrcpy.stopControl()
             scrcpy.resetTier()
@@ -422,6 +451,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (!adb.online.value) return
         val state = _ui.value
         if (state.mirrorState != MirrorState.ON || state.mirrorBusy) return
+        // With no visible surface there are no rendered-frame timestamps, so
+        // adaptation would misread a tab switch as a network stall and restart
+        // the whole mirror. Only adapt while Home owns the surface.
+        if (state.tab != Tab.HOME || mirrorSurfaceToken == null || !scrcpy.surfaceReady.value) return
         when (scrcpy.checkNetworkAdapt()) {
             -1 -> {
                 note("Rede instável: reduzindo para ${scrcpy.currentTier().name}.", ToastKind.INFO)
@@ -481,7 +514,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 applyReconnectResult(result, showMessages = true)
             } catch (t: Throwable) {
                 note("Falha ao reconectar: ${trunc(t.message, 110)}", ToastKind.ERROR)
-                toast("Falha ao reconectar.", ToastKind.ERROR)
+                toast("Falha ao reconectar.", ToastKind.ERROR, logError = false)
                 handleOnline(false)
             } finally {
                 reconnecting.set(false)
@@ -762,7 +795,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val reason = scrcpy.error.value.ifBlank { "motivo desconhecido" }
                 _ui.update { it.copy(mirrorError = reason, mirrorProgress = "") }
                 note("Espelho falhou: ${trunc(reason, 320)}", ToastKind.ERROR)
-                if (announce) toast("Espelho falhou (detalhes em Ajustes).", ToastKind.ERROR)
+                if (announce) toast("Espelho falhou (detalhes em Ajustes).", ToastKind.ERROR, logError = false)
             }
         } catch (t: Throwable) {
             if (attempt == mirrorAttemptId) {
@@ -770,7 +803,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val reason = trunc(failureDetail(t), 320)
                 _ui.update { it.copy(mirrorError = reason, mirrorProgress = "") }
                 note("Espelho falhou: $reason", ToastKind.ERROR)
-                if (announce) toast("Espelho falhou (detalhes em Ajustes).", ToastKind.ERROR)
+                if (announce) toast("Espelho falhou (detalhes em Ajustes).", ToastKind.ERROR, logError = false)
             }
         } finally {
             if (attempt == mirrorAttemptId) {
@@ -927,6 +960,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         else -> "Captura indisponível: $detail (o toque continua ativo)"
                     }
                     _ui.update { it.copy(screenshot = null, screenshotStatus = status) }
+                    if (status.startsWith("Captura indisponível")) logProblem(status)
                 } else {
                     val status = "Captura " + SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date()) +
                         " (desativada)"
@@ -1099,6 +1133,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // --------------------------------------------------------- preferencias --
+
+    fun setVerboseErrors(enabled: Boolean) {
+        _ui.update {
+            it.copy(
+                prefs = it.prefs.copy(verboseErrors = enabled),
+                errorLog = if (enabled) it.errorLog else emptyList(),
+            )
+        }
+        safeLaunch { prefsStore.update { it.copy(verboseErrors = enabled) } }
+    }
+
+    fun clearErrorLog() {
+        _ui.update { it.copy(errorLog = emptyList()) }
+    }
 
     fun setMirrorEnabled(enabled: Boolean) {
         _ui.update { it.copy(prefs = it.prefs.copy(mirror = enabled)) }

@@ -15,7 +15,9 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
@@ -32,6 +34,7 @@ import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 private const val ADB_OPEN_TIMEOUT_MS = 8_000L
 
@@ -59,6 +62,18 @@ class AdbManager(context: Context) : Closeable {
     @Volatile
     private var rootHost: String? = null
     private val rootProbeLock = Mutex()
+
+    /** Scrcpy startup/push operations must not be interrupted by health probes. */
+    private val criticalDepth = AtomicInteger(0)
+
+    suspend fun <T> withCritical(block: suspend () -> T): T {
+        criticalDepth.incrementAndGet()
+        try {
+            return block()
+        } finally {
+            criticalDepth.decrementAndGet()
+        }
+    }
 
     /** Disposing a live connection performs blocking socket I/O. */
     private val closeScope = CoroutineScope(Dispatchers.IO)
@@ -125,29 +140,48 @@ class AdbManager(context: Context) : Closeable {
         var lastPing = 0L
         var lastReconnect = 0L
         var lastWatchdog = 0L
+        var wasCritical = false
         monitorJob = scope.launch {
             while (isActive) {
                 val now = System.currentTimeMillis()
                 val connected = online.value && manager?.isConnected == true
+                val critical = criticalDepth.get() > 0
                 val controlLive = runCatching { controlAlive() }.getOrDefault(false)
-                if (!connected && online.value) setOnline(false)
+                if (wasCritical && !critical) {
+                    // Give the freshly started session a grace period instead of
+                    // firing both probes back-to-back in the next iteration.
+                    lastPing = now
+                    lastWatchdog = now
+                }
+                wasCritical = critical
+                if (!connected && online.value && !critical) setOnline(false)
 
-                if (connected && !controlLive && now - lastPing >= 3_000L) {
+                if (connected && !critical && !controlLive && now - lastPing >= 3_000L) {
                     lastPing = now
                     val probe = shell("echo ok", 8_000)
-                    if (!probe.ok || !probe.stdout.contains("ok")) {
+                    val stillCritical = criticalDepth.get() > 0 ||
+                        runCatching { controlAlive() }.getOrDefault(false)
+                    if (!stillCritical && (!probe.ok || !probe.stdout.contains("ok"))) {
                         manager?.let { runCatching { it.disconnect() } }
                         setOnline(false)
                     }
                 }
-                if (!online.value && host.value.isNotBlank() && now - lastReconnect >= 10_000L) {
+                if (criticalDepth.get() == 0 && !online.value && host.value.isNotBlank() &&
+                    !runCatching { controlAlive() }.getOrDefault(false) &&
+                    now - lastReconnect >= 10_000L
+                ) {
                     lastReconnect = now
                     reconnect()
                 }
-                if (online.value && !controlLive && now - lastWatchdog >= 20_000L) {
+                if (online.value && criticalDepth.get() == 0 &&
+                    !runCatching { controlAlive() }.getOrDefault(false) &&
+                    now - lastWatchdog >= 20_000L
+                ) {
                     lastWatchdog = now
                     val probe = shell("echo watchdog", 10_000)
-                    if (!probe.ok || !probe.stdout.contains("watchdog")) {
+                    val stillCritical = criticalDepth.get() > 0 ||
+                        runCatching { controlAlive() }.getOrDefault(false)
+                    if (!stillCritical && (!probe.ok || !probe.stdout.contains("watchdog"))) {
                         manager?.let { runCatching { it.disconnect() } }
                         setOnline(false)
                     }
@@ -189,6 +223,9 @@ class AdbManager(context: Context) : Closeable {
         } catch (error: TimeoutCancellationException) {
             opener.interrupt()
             throw IOException("tempo esgotado ao abrir stream ADB: $destination")
+        } catch (error: CancellationException) {
+            opener.interrupt()
+            throw error
         }
     }
 
@@ -196,13 +233,18 @@ class AdbManager(context: Context) : Closeable {
         withContext(Dispatchers.IO) {
             val stream = try {
                 openStream("shell:$command")
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Exception) {
                 return@withContext ShellResult(1, "", error.message ?: "ADB indisponível")
             }
             val output = ByteArrayOutputStream()
             val buffer = ByteArray(16 * 1024)
             val expired = AtomicBoolean(false)
-            val watchdog = launch {
+            // Detached from the caller's job: an outer timeout must not cancel the
+            // watchdog that unblocks a stream.read() stuck in Object.wait().
+            val watchdogScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            val watchdog = watchdogScope.launch {
                 delay(timeoutMs.coerceAtLeast(1L))
                 expired.set(true)
                 closeQuietly(stream)
@@ -214,8 +256,10 @@ class AdbManager(context: Context) : Closeable {
                     if (count <= 0) break
                     output.write(buffer, 0, count)
                 }
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Exception) {
-                if (error !is CancellationException && !expired.get()) {
+                if (!expired.get()) {
                     val message = error.message.orEmpty()
                     if (!message.contains("Stream closed", ignoreCase = true)) {
                         readFailure = message.ifEmpty { error.javaClass.simpleName }
@@ -223,6 +267,7 @@ class AdbManager(context: Context) : Closeable {
                 }
             } finally {
                 watchdog.cancel()
+                watchdogScope.cancel()
                 closeQuietly(stream)
             }
             val decoded = shellStripExitCode(output.toByteArray())
@@ -326,14 +371,74 @@ class AdbManager(context: Context) : Closeable {
     }
 
     suspend fun remoteFileSize(path: String): Long? = withContext(Dispatchers.IO) {
-        runCatching { AdbSync.stat(this@AdbManager, requireAbsoluteRemote(path))?.size }.getOrNull()
+        runCatching { AdbSync.stat(this@AdbManager, requireAbsoluteRemote(path))?.size }
+            .onFailure { if (it is CancellationException) throw it }
+            .getOrNull()
     }
 
     suspend fun pushBytes(bytes: ByteArray, remotePath: String, mode: Int = 0b110100100): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
                 AdbSync.push(this@AdbManager, requireAbsoluteRemote(remotePath), mode, bytes)
-            }
+            }.onFailure { if (it is CancellationException) throw it }
+        }
+
+    /**
+     * Binary push without the ADB `sync:` service. The JAR is written through a
+     * shell stream to a temporary file and only then moved into place, so a
+     * failed transfer can never leave a partial server behind.
+     */
+    suspend fun pushBytesViaShell(bytes: ByteArray, remotePath: String): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val path = requireAbsoluteRemote(remotePath)
+                val temp = "$path.tmp"
+                val stream = openStream("shell:cat > ${shellQuote(temp)}")
+                val done = AtomicBoolean(false)
+                val watchdogScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+                val watchdog = watchdogScope.launch {
+                    delay(25_000L)
+                    if (!done.get()) closeQuietly(stream)
+                }
+                val buffer = ByteArray(1024)
+                val drain = launch(Dispatchers.IO) {
+                    try {
+                        while (true) {
+                            if (stream.read(buffer, 0, buffer.size) <= 0) break
+                        }
+                    } catch (_: Exception) {
+                        // The stream is closed in finally; output is only a trailer.
+                    }
+                }
+                try {
+                    var offset = 0
+                    while (offset < bytes.size) {
+                        val count = minOf(16 * 1024, bytes.size - offset)
+                        stream.write(bytes, offset, count)
+                        stream.flush()
+                        offset += count
+                    }
+                    stream.close()
+                    // The write deadline covers transfer only. A slow trailer must
+                    // not discard a complete JAR or leave an orphan .tmp behind.
+                    done.set(true)
+                    runCatching { withTimeout(5_000L) { drain.join() } }
+                    drain.cancel()
+                    val move = shell(
+                        "mv -f ${shellQuote(temp)} ${shellQuote(path)} && chmod 0644 ${shellQuote(path)}",
+                        8_000L,
+                    )
+                    if (!move.ok) {
+                        throw IOException("falha ao finalizar envio: ${move.stderr.ifBlank { move.stdout }}")
+                    }
+                } finally {
+                    done.set(true)
+                    watchdog.cancel()
+                    watchdogScope.cancel()
+                    drain.cancel()
+                    closeQuietly(stream)
+                }
+            }.onFailure { if (it is CancellationException) throw it }
         }
 
     suspend fun pushLocalFile(local: File, remotePath: String): Result<Unit> =
@@ -341,14 +446,14 @@ class AdbManager(context: Context) : Closeable {
             runCatching {
                 if (!local.isFile) throw IOException("Arquivo local não encontrado: ${local.path}")
                 AdbSync.push(this@AdbManager, requireAbsoluteRemote(remotePath), 0b110100100, local.readBytes())
-            }
+            }.onFailure { if (it is CancellationException) throw it }
         }
 
     suspend fun pullRemoteFile(remotePath: String, local: File): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
                 AdbSync.pull(this@AdbManager, requireAbsoluteRemote(remotePath), local)
-            }
+            }.onFailure { if (it is CancellationException) throw it }
         }
 
     suspend fun listRemoteDir(path: String): Result<List<FileEntry>> =
@@ -357,7 +462,7 @@ class AdbManager(context: Context) : Closeable {
                 val normalized = normalizeRemote(path)
                     ?: throw IOException("Caminho remoto inválido: $path")
                 AdbSync.list(this@AdbManager, normalized)
-            }
+            }.onFailure { if (it is CancellationException) throw it }
         }
 
     override fun close() {

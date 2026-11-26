@@ -29,6 +29,7 @@ private object Keys {
     val NIGHT_MODE = booleanPreferencesKey("night_mode")
     val NIGHT_BRIGHT = intPreferencesKey("night_bright")
     val NIGHT_WARM = intPreferencesKey("night_warm")
+    val VERBOSE_ERRORS = booleanPreferencesKey("verbose_errors")
     val FAVORITES = stringSetPreferencesKey("favorites")
 }
 
@@ -83,6 +84,7 @@ class AppPreferences(context: Context) {
         nightMode = p[Keys.NIGHT_MODE] ?: Prefs().nightMode,
         nightBright = p[Keys.NIGHT_BRIGHT] ?: Prefs().nightBright,
         nightWarm = p[Keys.NIGHT_WARM] ?: Prefs().nightWarm,
+        verboseErrors = p[Keys.VERBOSE_ERRORS] ?: Prefs().verboseErrors,
     ).validated()
 
     private fun write(p: MutablePreferences, prefs: Prefs) {
@@ -98,6 +100,7 @@ class AppPreferences(context: Context) {
         p[Keys.NIGHT_MODE] = prefs.nightMode
         p[Keys.NIGHT_BRIGHT] = prefs.nightBright
         p[Keys.NIGHT_WARM] = prefs.nightWarm
+        p[Keys.VERBOSE_ERRORS] = prefs.verboseErrors
         dropLegacy(p)
     }
 

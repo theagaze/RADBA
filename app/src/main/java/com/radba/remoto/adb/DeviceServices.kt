@@ -348,23 +348,15 @@ class DeviceServices(private val adb: AdbManager) {
 
     suspend fun screenshot(): ScreenshotResult {
         val direct = readStreamToBytes(adb, "exec-out:screencap -p", 25_000)
-        if (direct.isPng()) return ScreenshotResult(direct)
+        extractPng(direct)?.let { return ScreenshotResult(it) }
         direct.screenshotFailureReason()?.let { return ScreenshotResult(null, it) }
 
         val shellRaw = readStreamToBytes(adb, "shell:screencap -p", 25_000)
             ?: return ScreenshotResult(null, direct.screenshotFailureReason() ?: "screencap não respondeu")
-        val withoutExit = shellStripExitCode(normalizeCrLf(shellRaw)).data
-        if (withoutExit.isPng()) return ScreenshotResult(withoutExit)
+        extractPng(shellRaw)?.let { return ScreenshotResult(it) }
 
-        if (withoutExit.size > 4) {
-            val header = ByteBuffer.wrap(withoutExit, 0, 4).order(ByteOrder.BIG_ENDIAN).int
-            val little = ByteBuffer.wrap(withoutExit, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
-            val body = withoutExit.copyOfRange(4, withoutExit.size)
-            if (header > 0 && header == body.size && body.isPng()) return ScreenshotResult(body)
-            if (little > 0 && little == body.size && body.isPng()) return ScreenshotResult(body)
-        }
-        val reason = withoutExit.screenshotFailureReason(includeGeneric = true)
-            ?: if (withoutExit.isEmpty()) "screencap retornou vazio" else "screencap retornou dados inválidos"
+        val reason = shellRaw.screenshotFailureReason(includeGeneric = true)
+            ?: if (shellRaw.isEmpty()) "screencap retornou vazio" else "screencap retornou dados inválidos"
         return ScreenshotResult(null, reason)
     }
 
@@ -449,23 +441,50 @@ private fun ByteArray?.screenshotFailureReason(includeGeneric: Boolean = false):
     }
 }
 
-private fun normalizeCrLf(bytes: ByteArray): ByteArray {
-    var count = 0
-    for (index in 0 until bytes.size - 1) {
-        if (bytes[index] == 13.toByte() && bytes[index + 1] == 10.toByte()) count++
+/**
+ * Extracts a PNG from raw ADB output without touching the payload. Normalizing
+ * CRLF here would corrupt the PNG signature because it contains 0D 0A.
+ */
+private fun extractPng(raw: ByteArray?): ByteArray? {
+    if (raw == null || raw.isEmpty()) return null
+    if (raw.isPng()) return raw
+
+    val stripped = shellStripExitCode(raw).data
+    if (stripped.isPng()) return stripped
+    unprefixPng(raw)?.let { return it }
+    unprefixPng(stripped)?.let { return it }
+
+    val start = indexOfMagic(raw, PNG_MAGIC, 4_096)
+    if (start > 0) {
+        val fromMagic = raw.copyOfRange(start, raw.size)
+        if (fromMagic.isPng()) return fromMagic
+        val fromMagicStripped = shellStripExitCode(fromMagic).data
+        if (fromMagicStripped.isPng()) return fromMagicStripped
     }
-    if (count == 0) return bytes
-    val result = ByteArray(bytes.size - count)
-    var source = 0
-    var target = 0
-    while (source < bytes.size) {
-        if (source + 1 < bytes.size &&
-            bytes[source] == 13.toByte() && bytes[source + 1] == 10.toByte()
-        ) {
-            source += 2
-        } else {
-            result[target++] = bytes[source++]
+    return null
+}
+
+private fun unprefixPng(data: ByteArray): ByteArray? {
+    if (data.size <= 4) return null
+    val body = data.copyOfRange(4, data.size)
+    val big = ByteBuffer.wrap(data, 0, 4).order(ByteOrder.BIG_ENDIAN).int
+    val little = ByteBuffer.wrap(data, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
+    if (big > 0 && big == body.size && body.isPng()) return body
+    if (little > 0 && little == body.size && body.isPng()) return body
+    return null
+}
+
+private fun indexOfMagic(data: ByteArray, magic: ByteArray, limit: Int): Int {
+    val last = minOf(data.size - magic.size, limit)
+    for (index in 0..last) {
+        var matched = true
+        for (offset in magic.indices) {
+            if (data[index + offset] != magic[offset]) {
+                matched = false
+                break
+            }
         }
+        if (matched) return index
     }
-    return result
+    return -1
 }

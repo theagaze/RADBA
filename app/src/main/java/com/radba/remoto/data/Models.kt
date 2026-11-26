@@ -49,6 +49,7 @@ data class Prefs(
     val nightMode: Boolean = false,
     val nightBright: Int = 35,
     val nightWarm: Int = 0,
+    val verboseErrors: Boolean = false,
 )
 
 data class RootStatus(
@@ -77,6 +78,12 @@ data class FileEntry(
 data class VolumeInfo(val level: Int, val max: Int)
 
 data class ScreenshotResult(val bytes: ByteArray? = null, val reason: String = "")
+
+data class ErrorLogEntry(
+    val time: String,
+    val text: String,
+    val count: Int = 1,
+)
 
 data class StorageStats(
     val total: Long = 0,

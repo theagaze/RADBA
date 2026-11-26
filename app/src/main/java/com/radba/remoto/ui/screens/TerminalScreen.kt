@@ -74,7 +74,7 @@ fun TerminalScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
     }
     val consoleBody = buildString {
         append("RADBA Terminal · Windows 11 style · ADB $host\n")
-        append("Comandos rodam no projetor (adb shell). 'cls' limpa · Ctrl+C cancela.\n")
+        append("Comandos rodam no projetor (adb shell). 'cls' limpa · toque longo copia.\n")
         append("Toque longo no texto seleciona e abre a barra Copiar do Android.\n\n")
         state.terminalLines.forEach { line ->
             when (line.kind) {
@@ -96,9 +96,11 @@ fun TerminalScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
         selection = range
     }
     LaunchedEffect(console.text.length) {
-        snapshotFlow { scrollState.maxValue }
-            .first { it > 0 }
-            .let { scrollState.scrollTo(it) }
+        // Keep the tail visible after the final layout pass; a one-shot
+        // snapshot can latch onto an intermediate maxValue while text grows.
+        snapshotFlow { scrollState.maxValue }.collect { max ->
+            if (max > 0) scrollState.scrollTo(max)
+        }
     }
 
     fun copySelection() {
@@ -276,7 +278,7 @@ fun TerminalScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 )
             }
             Text(
-                text = "Ctrl+C cancela · ↑/↓ histórico",
+                text = "Toque longo copia · ↑/↓ histórico",
                 color = errorColor,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 10.sp,

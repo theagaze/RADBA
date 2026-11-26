@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -207,13 +208,19 @@ fun FilesScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
             title = { Text(text = "Apagar", color = GlassColors.text) },
             text = { Text(text = "Apagar “${entry.name}”? Não pode ser desfeito.", color = GlassColors.sub) },
             confirmButton = {
-                TextButton(onClick = {
-                    viewModel.deleteFile(entry)
-                    deleteTarget = null
-                }) { Text(text = "Apagar", color = GlassColors.bad) }
+                TextButton(
+                    onClick = {
+                        viewModel.deleteFile(entry)
+                        deleteTarget = null
+                    },
+                    modifier = Modifier.heightIn(min = 44.dp),
+                ) { Text(text = "Apagar", color = GlassColors.bad) }
             },
             dismissButton = {
-                TextButton(onClick = { deleteTarget = null }) { Text(text = "Cancelar", color = GlassColors.sub) }
+                TextButton(
+                    onClick = { deleteTarget = null },
+                    modifier = Modifier.heightIn(min = 44.dp),
+                ) { Text(text = "Cancelar", color = GlassColors.sub) }
             },
         )
     }
@@ -240,13 +247,19 @@ fun FilesScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 )
             },
             confirmButton = {
-                TextButton(onClick = {
-                    viewModel.newFolder(textDraft.trim())
-                    newFolderDialog = false
-                }) { Text(text = "Criar", color = GlassColors.acc) }
+                TextButton(
+                    onClick = {
+                        viewModel.newFolder(textDraft.trim())
+                        newFolderDialog = false
+                    },
+                    modifier = Modifier.heightIn(min = 44.dp),
+                ) { Text(text = "Criar", color = GlassColors.acc) }
             },
             dismissButton = {
-                TextButton(onClick = { newFolderDialog = false }) { Text(text = "Cancelar", color = GlassColors.sub) }
+                TextButton(
+                    onClick = { newFolderDialog = false },
+                    modifier = Modifier.heightIn(min = 44.dp),
+                ) { Text(text = "Cancelar", color = GlassColors.sub) }
             },
         )
     }
@@ -279,17 +292,23 @@ fun FilesScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 )
             },
             confirmButton = {
-                TextButton(onClick = {
-                    when (op.kind) {
-                        TextOpKind.RENAME -> viewModel.renameFile(op.entry, textDraft.trim())
-                        TextOpKind.COPY -> viewModel.copyFile(op.entry, textDraft.trim())
-                        TextOpKind.MOVE -> viewModel.moveFile(op.entry, textDraft.trim())
-                    }
-                    textOp = null
-                }) { Text(text = "Confirmar", color = GlassColors.acc) }
+                TextButton(
+                    onClick = {
+                        when (op.kind) {
+                            TextOpKind.RENAME -> viewModel.renameFile(op.entry, textDraft.trim())
+                            TextOpKind.COPY -> viewModel.copyFile(op.entry, textDraft.trim())
+                            TextOpKind.MOVE -> viewModel.moveFile(op.entry, textDraft.trim())
+                        }
+                        textOp = null
+                    },
+                    modifier = Modifier.heightIn(min = 44.dp),
+                ) { Text(text = "Confirmar", color = GlassColors.acc) }
             },
             dismissButton = {
-                TextButton(onClick = { textOp = null }) { Text(text = "Cancelar", color = GlassColors.sub) }
+                TextButton(
+                    onClick = { textOp = null },
+                    modifier = Modifier.heightIn(min = 44.dp),
+                ) { Text(text = "Cancelar", color = GlassColors.sub) }
             },
         )
     }

@@ -104,6 +104,10 @@ class VideoDecoder : Closeable {
         surfaceRef = surface
         surfaceGeneration++
         expectKeyFrame = true
+        // Invalidate frame proofs synchronously: a buffer already in flight was
+        // encoded for the previous Surface and must not satisfy startup.
+        firstFrame.value = false
+        frameReceived.value = false
         synchronized(lock) { (lock as java.lang.Object).notifyAll() }
     }
 
@@ -129,8 +133,16 @@ class VideoDecoder : Closeable {
             // reliable when the config is prefixed to the next access unit,
             // exactly like scrcpy's own packet merger does.
             synchronized(lock) {
-                lastConfig = EncodedPacket(data.copyOf(), flags, ptsUs)
-                pendingConfig = data.copyOf()
+                // SPS and PPS can arrive as separate config packets; keep all of
+                // them so the next access unit carries a complete codec config.
+                val previous = pendingConfig
+                pendingConfig = if (previous == null) data.copyOf() else previous + data
+                val previousSaved = lastConfig?.data
+                lastConfig = EncodedPacket(
+                    if (previousSaved == null) data.copyOf() else previousSaved + data,
+                    flags,
+                    ptsUs,
+                )
                 (lock as java.lang.Object).notifyAll()
             }
             return
@@ -256,7 +268,7 @@ class VideoDecoder : Closeable {
                 }
 
                 val activeCodec = codec ?: continue
-                val outputDone = drainOutput(activeCodec)
+                val outputDone = drainOutput(activeCodec, seenGeneration)
 
                 if (inputEosSent) {
                     if (outputDone) {
@@ -350,10 +362,10 @@ class VideoDecoder : Closeable {
         }
     }
 
-    private fun drainOutput(codec: MediaCodec): Boolean {
+    private fun drainOutput(codec: MediaCodec, generation: Int): Boolean {
         val info = MediaCodec.BufferInfo()
         var reachedEos = false
-        while (!closed) {
+        while (!closed && generation == surfaceGeneration) {
             val index = try {
                 codec.dequeueOutputBuffer(info, OUTPUT_TIMEOUT_US)
             } catch (t: Throwable) {
@@ -368,17 +380,18 @@ class VideoDecoder : Closeable {
                     val configOnly = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
                     val isFrame = !configOnly &&
                         (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) == 0
-                    if (isFrame) {
+                    val currentGeneration = generation == surfaceGeneration
+                    if (isFrame && currentGeneration) {
                         if (!frameReceived.value) frameReceived.value = true
                         // A successful frame proves the codec recovered from any
                         // transient failure; do not keep restarting forever.
                         error.value = ""
                     }
-                    val render = !closed && surfaceRef != null && isFrame
+                    val render = !closed && surfaceRef != null && isFrame && currentGeneration
                     try {
                         codec.releaseOutputBuffer(index, render)
                     } catch (t: Throwable) {
-                        handleCodecFailure(t)
+                        if (currentGeneration) handleCodecFailure(t)
                         return reachedEos
                     }
                     if (render) {

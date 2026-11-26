@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
@@ -321,6 +322,74 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 GlassButton("Atualizar info", { viewModel.refreshSettings() }, modifier = Modifier.weight(1f), compact = true)
             }
         }
+
+        GlassCard {
+            Text(
+                text = "Diagnóstico de erros",
+                color = GlassColors.text,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Bold,
+            )
+            GlassToggle(
+                checked = prefs.verboseErrors,
+                onCheckedChange = { viewModel.setVerboseErrors(it) },
+                label = "Log de erros (modo diagnose)",
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                accent = GlassColors.bad,
+            )
+            Text(
+                text = "Registra apenas falhas e repetições em loop. Mensagens iguais são agrupadas com contador.",
+                color = GlassColors.sub,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+            if (prefs.verboseErrors) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "${state.errorLog.size} evento(s)",
+                        color = GlassColors.sub,
+                        fontSize = 11.sp,
+                        modifier = Modifier.weight(1f),
+                    )
+                    GlassButton(
+                        "Limpar",
+                        onClick = { viewModel.clearErrorLog() },
+                        compact = true,
+                        danger = true,
+                    )
+                }
+                SelectionContainer(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 240.dp)
+                        .verticalScroll(rememberScrollState())
+                        .padding(top = 6.dp),
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        if (state.errorLog.isEmpty()) {
+                            Text(
+                                text = "Nenhum erro registrado desde a ativação.",
+                                color = GlassColors.sub,
+                                fontSize = 11.sp,
+                            )
+                        } else {
+                            state.errorLog.forEach { entry ->
+                                val count = if (entry.count > 1) " ×${entry.count}" else ""
+                                Text(
+                                    text = "${entry.time}$count · ${entry.text}",
+                                    color = GlassColors.bad,
+                                    fontSize = 11.sp,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if (pairDialog) {
@@ -346,13 +415,19 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 }
             },
             confirmButton = {
-                TextButton(onClick = {
-                    viewModel.pair(pairAddress.trim(), pairCode.trim())
-                    pairDialog = false
-                }) { Text(text = "Parear", color = GlassColors.acc2) }
+                TextButton(
+                    onClick = {
+                        viewModel.pair(pairAddress.trim(), pairCode.trim())
+                        pairDialog = false
+                    },
+                    modifier = Modifier.heightIn(min = 44.dp),
+                ) { Text(text = "Parear", color = GlassColors.acc2) }
             },
             dismissButton = {
-                TextButton(onClick = { pairDialog = false }) { Text(text = "Cancelar", color = GlassColors.sub) }
+                TextButton(
+                    onClick = { pairDialog = false },
+                    modifier = Modifier.heightIn(min = 44.dp),
+                ) { Text(text = "Cancelar", color = GlassColors.sub) }
             },
         )
     }

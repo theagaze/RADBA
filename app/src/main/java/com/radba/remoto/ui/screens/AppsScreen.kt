@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -192,11 +193,14 @@ fun AppsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 )
             },
             confirmButton = {
-                TextButton(onClick = {
-                    if (op.uninstall) viewModel.uninstallApp(op.app.packageName)
-                    else viewModel.forceStopApp(op.app.packageName)
-                    confirm = null
-                }) {
+                TextButton(
+                    onClick = {
+                        if (op.uninstall) viewModel.uninstallApp(op.app.packageName)
+                        else viewModel.forceStopApp(op.app.packageName)
+                        confirm = null
+                    },
+                    modifier = Modifier.heightIn(min = 44.dp),
+                ) {
                     Text(
                         text = if (op.uninstall) "Desinstalar" else "Forçar parada",
                         color = if (op.uninstall) GlassColors.bad else GlassColors.warn,
@@ -204,7 +208,10 @@ fun AppsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 }
             },
             dismissButton = {
-                TextButton(onClick = { confirm = null }) { Text(text = "Cancelar", color = GlassColors.sub) }
+                TextButton(
+                    onClick = { confirm = null },
+                    modifier = Modifier.heightIn(min = 44.dp),
+                ) { Text(text = "Cancelar", color = GlassColors.sub) }
             },
         )
     }
