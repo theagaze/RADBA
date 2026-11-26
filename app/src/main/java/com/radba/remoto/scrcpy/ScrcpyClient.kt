@@ -255,7 +255,8 @@ class ScrcpyClient(
                     goodSinceMs = 0L
                     return 1
                 }
-            } else {
+            } else if (fps >= 2f) {
+                // Python keeps the upgrade timer untouched when frames are nearly absent.
                 goodSinceMs = 0L
             }
         }
