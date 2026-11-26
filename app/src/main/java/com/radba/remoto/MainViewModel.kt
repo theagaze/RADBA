@@ -72,7 +72,7 @@ private val DISPLAY_SIZE_REGEX = Regex("""(\d+)\s*[xX]\s*(\d+)""")
 
 private const val TOUCH_HOVER = 7
 private const val MIRROR_START_TIMEOUT_MS = 45_000L
-private const val MIRROR_NO_FRAME_TIMEOUT_MS = 20_000L
+private const val MIRROR_NO_FRAME_TIMEOUT_MS = 12_000L
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     data class UiState(
@@ -371,8 +371,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     Tab.PERF -> refreshPerf()
                     else -> Unit
                 }
-                ensureMirrorInternal()
                 rootJob.join()
+                ensureMirrorInternal()
                 if (!_ui.value.prefs.mirror) refreshScreenshot()
             }
         } else {
@@ -646,13 +646,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        if (state.mirrorState == MirrorState.ON &&
-            frameAge > MIRROR_NO_FRAME_TIMEOUT_MS &&
-            now >= mirrorRetryAfterMs
-        ) {
-            mirrorRetryAfterMs = now + 5_000L
-            noteAndToast("Sem frames no espelho; reiniciando…", ToastKind.ERROR)
-            safeLaunch { restartMirrorInternal(announce = false) }
+        if (state.mirrorState == MirrorState.ON) {
+            if (_ui.value.mirrorBusy) return
+            val decoderError = scrcpy.decoderError()
+            if (decoderError.isNotBlank() && now >= mirrorRetryAfterMs) {
+                mirrorRetryAfterMs = now + 5_000L
+                val message = "Decoder do vídeo falhou; reiniciando…\n${trunc(decoderError, 140)}"
+                _ui.update { it.copy(mirrorError = message) }
+                note(message, ToastKind.ERROR)
+                safeLaunch { restartMirrorInternal(announce = false) }
+                return
+            }
+            if (frameAge > MIRROR_NO_FRAME_TIMEOUT_MS && now >= mirrorRetryAfterMs) {
+                mirrorRetryAfterMs = now + 5_000L
+                noteAndToast("Sem frames no espelho; reiniciando…", ToastKind.ERROR)
+                safeLaunch { restartMirrorInternal(announce = false) }
+            }
         }
     }
 

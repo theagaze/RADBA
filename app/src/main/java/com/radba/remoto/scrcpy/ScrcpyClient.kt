@@ -43,6 +43,7 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
@@ -64,6 +65,7 @@ class ScrcpyClient(
 
     val state = MutableStateFlow(MirrorState.OFF)
     val error = MutableStateFlow("")
+    val surfaceReady = MutableStateFlow(false)
     val activeEncoder = MutableStateFlow("")
     val deviceSize = MutableStateFlow(0 to 0)
     val serverFps = MutableStateFlow(0)
@@ -113,6 +115,7 @@ class ScrcpyClient(
 
     fun attachSurface(surface: Surface?) {
         surfaceRef = surface
+        surfaceReady.value = surface != null
         decoder?.attachSurface(surface)
     }
 
@@ -148,10 +151,14 @@ class ScrcpyClient(
         return try {
             onProgress?.invoke("Preparando servidor scrcpy…")
             val prefs = prefsProvider()
-            val jar = prepareServerJar(onProgress)
+            val jar = withTimeoutOrNull(30_000L) { prepareServerJar(onProgress) }
+                ?: throw IOException("tempo esgotado ao preparar o servidor scrcpy")
 
-            if (prefs.rootFixVideo) applyRootFixes(onProgress)
-            pushJarIfNeeded(jar, onProgress)
+            if (prefs.rootFixVideo) {
+                withTimeoutOrNull(ROOT_FIX_BUDGET_MS) { applyRootFixes(onProgress) }
+            }
+            val pushed = withTimeoutOrNull(20_000L) { pushJarIfNeeded(jar, onProgress) }
+            if (pushed == null) throw IOException("tempo esgotado ao enviar o servidor scrcpy")
 
             val plan = encoderPlan()
             val tier = currentTier()
@@ -176,7 +183,11 @@ class ScrcpyClient(
                     state.value = MirrorState.ON
                     return true
                 } catch (t: Throwable) {
-                    if (token != generation || t is CancellationException) return false
+                    if (token != generation) return false
+                    if (t is CancellationException) {
+                        state.value = MirrorState.OFF
+                        return false
+                    }
                     lastReason = describe(t)
                     onProgress?.invoke(lastReason)
                     teardown()
@@ -189,8 +200,8 @@ class ScrcpyClient(
             }
             false
         } catch (t: Throwable) {
-            if (token == generation && t !is CancellationException) {
-                error.value = describe(t)
+            if (token == generation) {
+                if (t !is CancellationException) error.value = describe(t)
                 state.value = MirrorState.OFF
             }
             false
@@ -209,6 +220,9 @@ class ScrcpyClient(
         val control = controlStream ?: return false
         return !video.isClosed && !control.isClosed && controlJob?.isActive == true
     }
+
+    /** Decoder failures that happen after the stream is considered active. */
+    fun decoderError(): String = decoder?.error?.value.orEmpty()
 
     fun currentTier(): VideoTier = VIDEO_TIERS[tierIndex.coerceIn(VIDEO_TIERS.indices)]
 
@@ -417,19 +431,20 @@ class ScrcpyClient(
         videoDecoder.configure(surfaceRef, width, height, softwareDecoder = software)
         videoJob = scope.launch(Dispatchers.IO) { readVideo(token, streams.first, videoDecoder) }
 
-        // A surface can legitimately be absent during auto-start; in that case
-        // accept a decoded frame. When a surface exists, require a real render.
-        val waitForRender = surfaceRef != null
+        // A surface can legitimately arrive during auto-start. Accept a decoded
+        // frame only while no surface exists; once a surface is ready, require
+        // an actual render to the current TextureView.
         val decoded = withTimeoutOrNull(FIRST_FRAME_TIMEOUT_MS) {
             combine(
                 videoDecoder.configured,
                 videoDecoder.frameReceived,
                 videoDecoder.firstFrame,
                 videoDecoder.error,
-            ) { configured, frame, rendered, decoderError ->
+                surfaceReady,
+            ) { configured, frame, rendered, decoderError, readySurface ->
                 when {
                     decoderError.isNotBlank() -> -1
-                    configured && frame && (!waitForRender || rendered) -> 1
+                    configured && frame && (!readySurface || rendered) -> 1
                     else -> 0
                 }
             }.first { it != 0 }
@@ -557,13 +572,19 @@ class ScrcpyClient(
         block: suspend () -> T,
     ): T? = coroutineScope {
         val budget = timeoutMs.coerceAtLeast(1L)
+        val completed = AtomicBoolean(false)
         val watchdog = launch(Dispatchers.IO) {
             delay(budget)
-            closeStream(stream)
+            if (!completed.get()) closeStream(stream)
         }
         try {
-            withTimeoutOrNull(budget) { block() }
+            withTimeoutOrNull(budget) {
+                val result = block()
+                completed.set(true)
+                result
+            }
         } finally {
+            completed.set(true)
             watchdog.cancel()
         }
     }
@@ -731,20 +752,36 @@ class ScrcpyClient(
     private suspend fun applyRootFixes(onProgress: ((String) -> Unit)?) {
         val host = adb.host.value
         if (rootFixesHost == host) return
+        // Do not spend the startup budget probing su on a device that is not
+        // already known to be rooted. The mirror works without these tweaks.
+        if (adb.cachedRootStatus().available != true) {
+            onProgress?.invoke("Sem root confirmado; ajustes de vídeo ignorados")
+            rootFixesHost = host
+            return
+        }
+        // All privileged commands share the outer startup budget so a slow media
+        // restart cannot consume the whole session timeout.
+        val deadline = SystemClock.elapsedRealtime() + ROOT_FIX_BUDGET_MS
+        fun budget(max: Long): Long =
+            (deadline - SystemClock.elapsedRealtime()).coerceIn(1L, max)
+
         onProgress?.invoke("Aplicando ajustes de vídeo (root)…")
-        val surfaceFix = runPrivileged("service call SurfaceFlinger 1008 i32 1", 5_000L)
+        val surfaceFix = runPrivileged("service call SurfaceFlinger 1008 i32 1", budget(5_000L))
         if (!surfaceFix.ok) return
-        val property = runPrivileged("getprop vendor.media.c2.vdec.support", 4_000L)
+        val property = runPrivileged("getprop vendor.media.c2.vdec.support", budget(4_000L))
         if (property.stdout.trim() != "false") {
             runPrivileged(
                 "setprop vendor.media.c2.vdec.support false && " +
                     "setprop ctl.restart android-hardware-media-c2-hal-1-2 && " +
                     "setprop ctl.restart media",
-                12_000L,
+                budget(12_000L),
             )
-            delay(1_500L)
+            delay(budget(1_500L))
         }
-        runPrivileged("pkill -f 'com.genymobile.scrcpy.Serve[r]' 2>/dev/null; echo ok", 5_000L)
+        runPrivileged(
+            "pkill -f 'com.genymobile.scrcpy.Serve[r]' 2>/dev/null; echo ok",
+            budget(5_000L),
+        )
         rootFixesHost = host
     }
 
@@ -901,6 +938,7 @@ class ScrcpyClient(
         const val MIN_JAR_SIZE = 10_000
         const val MAX_LOG_CHARS = 16_384
         const val SESSION_START_TIMEOUT_MS = 45_000L
+        const val ROOT_FIX_BUDGET_MS = 12_000L
         const val STREAM_TIMEOUT_MS = 12_000L
         const val FIRST_FRAME_TIMEOUT_MS = 12_000L
         const val VIDEO_READ_TIMEOUT_MS = 8_000L

@@ -87,10 +87,10 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
 
     val stageMessage = when {
         state.connection == ConnectionState.DISCONNECTED -> "Projetor desconectado"
+        state.prefs.mirror && state.mirrorError.isNotBlank() ->
+            "Transmissão melhorada (scrcpy) reconectando…\n${trunc(state.mirrorError, 110)}"
         waitingFrame -> "Aguardando primeiro frame…\n${trunc(progress, 110)}"
         mirrorOn -> null
-        state.prefs.mirror && state.mirrorError.isNotBlank() ->
-            "Transmissão melhorada (scrcpy) reconectando…\n${trunc(state.mirrorError, 90)}"
         state.prefs.mirror -> "Iniciando transmissão melhorada (scrcpy)…\n${trunc(progress, 110)}"
         state.screenshot != null -> null
         else -> state.screenshotStatus.ifBlank { "Aguardando conexão…" }
@@ -98,6 +98,7 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
 
     val status = when {
         state.connection == ConnectionState.DISCONNECTED -> "Desconectado"
+        state.prefs.mirror && state.mirrorError.isNotBlank() -> "Reconectando scrcpy…"
         waitingFrame -> "Aguardando primeiro frame…"
         mirrorOn -> buildString {
             append("scrcpy · ")
@@ -108,7 +109,6 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
             }
             if (state.mirrorLatencyMs > 0) append(" · ").append(state.mirrorLatencyMs).append("ms")
         }
-        state.prefs.mirror && state.mirrorError.isNotBlank() -> "Reconectando scrcpy…"
         state.prefs.mirror -> trunc(progress, 52)
         else -> state.screenshotStatus.ifBlank { "Aguardando…" }
     }
@@ -186,8 +186,8 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
 
                             override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
                                 val previous = mirrorSurface
-                                runCatching { viewModel.detachMirrorSurface(previous) }
                                 if (previous != null) {
+                                    runCatching { viewModel.detachMirrorSurface(previous) }
                                     Handler(Looper.getMainLooper()).postDelayed({
                                         runCatching { previous.release() }
                                     }, 500L)

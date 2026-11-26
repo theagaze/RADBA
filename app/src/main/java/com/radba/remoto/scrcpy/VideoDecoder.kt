@@ -44,9 +44,6 @@ class VideoDecoder : Closeable {
     private var expectKeyFrame = false
 
     @Volatile
-    private var expectKeyFrameSinceMs = 0L
-
-    @Volatile
     private var endOfStream = false
 
     @Volatile
@@ -73,6 +70,10 @@ class VideoDecoder : Closeable {
     /** Last SPS/PPS access unit, replayed whenever the codec is recreated. */
     @Volatile
     private var lastConfig: EncodedPacket? = null
+
+    /** SPS/PPS waiting to be prepended to the next media packet. */
+    @Volatile
+    private var pendingConfig: ByteArray? = null
 
     private val lock = Any()
     private var thread: Thread? = null
@@ -103,14 +104,12 @@ class VideoDecoder : Closeable {
         surfaceRef = surface
         surfaceGeneration++
         expectKeyFrame = true
-        expectKeyFrameSinceMs = SystemClock.elapsedRealtime()
         synchronized(lock) { (lock as java.lang.Object).notifyAll() }
     }
 
     /** Drop non-intra frames until the next key frame (useful after reattach). */
     fun expectKeyFrame() {
         expectKeyFrame = true
-        expectKeyFrameSinceMs = SystemClock.elapsedRealtime()
     }
 
     /** Queue one encoded access unit. [flags] use MediaCodec.BUFFER_FLAG_*. */
@@ -120,15 +119,26 @@ class VideoDecoder : Closeable {
         val isConfig = flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
         val isKey = flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
         if (expectKeyFrame && !isConfig && !isKey) {
-            // Do not stay black forever if this encoder does not mark keyframes.
-            if (SystemClock.elapsedRealtime() - expectKeyFrameSinceMs < KEYFRAME_GRACE_MS) return
-            expectKeyFrame = false
+            // A P-frame cannot decode without the preceding reference frame.
+            // Wait for the next IDR emitted by the server instead.
+            return
         }
         if (isKey) expectKeyFrame = false
         if (isConfig) {
-            synchronized(lock) { lastConfig = EncodedPacket(data.copyOf(), flags, ptsUs) }
+            // scrcpy sends SPS/PPS as a separate packet. MediaCodec is more
+            // reliable when the config is prefixed to the next access unit,
+            // exactly like scrcpy's own packet merger does.
+            synchronized(lock) {
+                lastConfig = EncodedPacket(data.copyOf(), flags, ptsUs)
+                pendingConfig = data.copyOf()
+                (lock as java.lang.Object).notifyAll()
+            }
+            return
         }
         synchronized(lock) {
+            val config = pendingConfig
+            pendingConfig = null
+            val payload = if (config == null) data.copyOf() else config + data
             if (packets.size >= MAX_PENDING) {
                 val iterator = packets.iterator()
                 var removed = false
@@ -140,7 +150,7 @@ class VideoDecoder : Closeable {
                 }
                 if (!removed) packets.removeFirst()
             }
-            packets.addLast(EncodedPacket(data.copyOf(), flags, ptsUs))
+            packets.addLast(EncodedPacket(payload, flags, ptsUs))
             (lock as java.lang.Object).notifyAll()
         }
     }
@@ -201,29 +211,40 @@ class VideoDecoder : Closeable {
     private fun decodeLoop() {
         var codec: MediaCodec? = null
         var seenGeneration = -1
+        var purgedGeneration = -1
         var inputEosSent = false
         try {
             while (!closed) {
                 if (codec == null || seenGeneration != surfaceGeneration) {
+                    val surfaceChanged = purgedGeneration != surfaceGeneration
                     seenGeneration = surfaceGeneration
+                    if (surfaceChanged) {
+                        // Packets decoded for the old codec are not valid for
+                        // the new one; drop them and wait for a fresh IDR.
+                        synchronized(lock) { packets.clear() }
+                        purgedGeneration = surfaceGeneration
+                    }
+                    expectKeyFrame = true
                     releaseCodec(codec)
                     codec = null
                     inputEosSent = false
                     configured.value = false
+                    firstFrame.value = false
+                    frameReceived.value = false
                     try {
                         val newCodec = createCodec(surfaceRef, width, height, mimeType)
                         codec = newCodec
                         configured.value = true
                         error.value = ""
-                        // scrcpy sends SPS/PPS only once; replay them so a codec
-                        // created after a surface change can decode immediately.
+                        // scrcpy sends SPS/PPS only once; replay them before the
+                        // next access unit when a codec is created after a
+                        // surface change.
                         lastConfig?.let { config ->
-                            try {
-                                enqueueWholePacket(newCodec, config)
-                            } catch (t: Throwable) {
-                                handleCodecFailure(t)
-                                releaseCodec(newCodec)
-                                codec = null
+                            synchronized(lock) {
+                                if (pendingConfig == null) {
+                                    pendingConfig = config.data.copyOf()
+                                    (lock as java.lang.Object).notifyAll()
+                                }
                             }
                         }
                     } catch (t: Throwable) {
@@ -347,7 +368,12 @@ class VideoDecoder : Closeable {
                     val configOnly = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
                     val isFrame = !configOnly &&
                         (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) == 0
-                    if (isFrame && !frameReceived.value) frameReceived.value = true
+                    if (isFrame) {
+                        if (!frameReceived.value) frameReceived.value = true
+                        // A successful frame proves the codec recovered from any
+                        // transient failure; do not keep restarting forever.
+                        error.value = ""
+                    }
                     val render = !closed && surfaceRef != null && isFrame
                     try {
                         codec.releaseOutputBuffer(index, render)
@@ -445,7 +471,6 @@ class VideoDecoder : Closeable {
         const val SOFTWARE_DECODER_C2 = "c2.android.avc.decoder"
         const val SOFTWARE_DECODER_OMX = "OMX.google.h264.decoder"
         const val MAX_PENDING = 48
-        const val KEYFRAME_GRACE_MS = 1_500L
         const val MAX_ENQUEUE_ATTEMPTS = 5_000
     }
 }
