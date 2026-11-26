@@ -20,6 +20,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
@@ -38,6 +39,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -163,8 +165,8 @@ class ScrcpyClient(
                     "${tier.name} · tentativa ${index + 1}/${plan.size}: ${encoder ?: "hardware (padrão)"}",
                 )
                 try {
-                    val launched = withTimeoutOrNull(20_000L) {
-                        launchSession(token, tier, encoder, onProgress)
+                    val launched = withTimeoutOrNull(SESSION_START_TIMEOUT_MS) {
+                        launchSession(token, tier, encoder, software, onProgress)
                         true
                     }
                     if (launched != true) throw IOException("tempo esgotado ao iniciar a sessão de vídeo")
@@ -276,7 +278,7 @@ class ScrcpyClient(
 
     fun sendKey(code: Int): Boolean {
         if (!isReady()) return false
-        val buffer = ByteBuffer.allocate(28).order(ByteOrder.BIG_ENDIAN)
+        val buffer = ByteBuffer.allocate(KEY_EVENT_BYTES * 2).order(ByteOrder.BIG_ENDIAN)
         appendKey(buffer, code, ACTION_DOWN)
         appendKey(buffer, code, ACTION_UP)
         return enqueue(buffer.array())
@@ -284,7 +286,7 @@ class ScrcpyClient(
 
     fun sendKeys(codes: List<Int>): Boolean {
         if (!isReady() || codes.isEmpty()) return false
-        val buffer = ByteBuffer.allocate(codes.size * 28).order(ByteOrder.BIG_ENDIAN)
+        val buffer = ByteBuffer.allocate(codes.size * KEY_EVENT_BYTES * 2).order(ByteOrder.BIG_ENDIAN)
         codes.forEach { code ->
             appendKey(buffer, code, ACTION_DOWN)
             appendKey(buffer, code, ACTION_UP)
@@ -360,6 +362,7 @@ class ScrcpyClient(
         token: Int,
         tier: VideoTier,
         encoder: String?,
+        software: Boolean,
         onProgress: ((String) -> Unit)?,
     ) {
         lastPacketAtMs = 0L
@@ -378,6 +381,7 @@ class ScrcpyClient(
         serverEnded = false
         ready = false
 
+        adb.shell("pkill -f 'com.genymobile.scrcpy.Serve[r]' 2>/dev/null; echo ok", 8_000L)
         onProgress?.invoke("Iniciando servidor no dispositivo…")
         val shell = withContext(Dispatchers.IO) { adb.openStream("shell:$command") }
         serverStream = shell
@@ -410,15 +414,30 @@ class ScrcpyClient(
         val (width, height) = deviceSize.value
         val videoDecoder = VideoDecoder()
         decoder = videoDecoder
-        videoDecoder.configure(surfaceRef, width, height)
+        videoDecoder.configure(surfaceRef, width, height, softwareDecoder = software)
         videoJob = scope.launch(Dispatchers.IO) { readVideo(token, streams.first, videoDecoder) }
 
+        // A surface can legitimately be absent during auto-start; in that case
+        // accept a decoded frame. When a surface exists, require a real render.
+        val waitForRender = surfaceRef != null
         val decoded = withTimeoutOrNull(FIRST_FRAME_TIMEOUT_MS) {
-            combine(videoDecoder.configured, videoDecoder.frameReceived) { configured, frame ->
-                configured && frame
-            }.first { it }
+            combine(
+                videoDecoder.configured,
+                videoDecoder.frameReceived,
+                videoDecoder.firstFrame,
+                videoDecoder.error,
+            ) { configured, frame, rendered, decoderError ->
+                when {
+                    decoderError.isNotBlank() -> -1
+                    configured && frame && (!waitForRender || rendered) -> 1
+                    else -> 0
+                }
+            }.first { it != 0 }
         }
-        if (decoded != true) throw IOException("nenhum frame decodificado")
+        if (decoded != 1) {
+            val detail = videoDecoder.error.value.ifBlank { "nenhum frame recebido" }
+            throw IOException("falha no decodificador: $detail")
+        }
     }
 
     private suspend fun openStreams(
@@ -428,12 +447,14 @@ class ScrcpyClient(
     ): Pair<AdbStream, AdbStream> = withContext(Dispatchers.IO) {
         val destination = "localabstract:scrcpy_$scid"
         val deadline = System.currentTimeMillis() + STREAM_TIMEOUT_MS
+        fun remaining(): Long = (deadline - System.currentTimeMillis()).coerceAtLeast(1L)
+        fun serverGone(): Boolean = serverEnded || serverStream?.isClosed == true
         var video: AdbStream? = null
         var control: AdbStream? = null
         try {
             while (video == null && System.currentTimeMillis() < deadline) {
                 checkGeneration(token)
-                if (serverEnded) throw IOException("o servidor scrcpy foi encerrado antes do vídeo")
+                if (serverGone()) throw IOException("o servidor scrcpy foi encerrado antes do vídeo")
                 try {
                     video = adb.openStream(destination)
                 } catch (t: Throwable) {
@@ -445,7 +466,7 @@ class ScrcpyClient(
 
             // scrcpy sends one dummy byte on accept so connection errors surface here.
             val dummy = ByteArray(1)
-            val dummyRead = withTimeoutOrNull(STREAM_TIMEOUT_MS) {
+            val dummyRead = withStreamGuard(videoStream, remaining()) {
                 readFully(videoStream, dummy, 0, 1, token)
             }
             if (dummyRead == null) throw IOException("tempo esgotado no handshake de vídeo")
@@ -453,7 +474,7 @@ class ScrcpyClient(
 
             while (control == null && System.currentTimeMillis() < deadline) {
                 checkGeneration(token)
-                if (serverEnded) throw IOException("o servidor scrcpy foi encerrado antes do controle")
+                if (serverGone()) throw IOException("o servidor scrcpy foi encerrado antes do controle")
                 try {
                     control = adb.openStream(destination)
                 } catch (t: Throwable) {
@@ -465,12 +486,18 @@ class ScrcpyClient(
 
             // 64-byte device name + codecId/width/height, all big endian.
             val meta = ByteArray(76)
-            val metaRead = withTimeoutOrNull(STREAM_TIMEOUT_MS) {
+            val metaRead = withStreamGuard(videoStream, remaining()) {
                 readFully(videoStream, meta, 0, meta.size, token)
             }
             if (metaRead == null) throw IOException("tempo esgotado ao ler metadados de vídeo")
-            val width = ByteBuffer.wrap(meta, 68, 4).order(ByteOrder.BIG_ENDIAN).int
-            val height = ByteBuffer.wrap(meta, 72, 4).order(ByteOrder.BIG_ENDIAN).int
+            val buffer = ByteBuffer.wrap(meta).order(ByteOrder.BIG_ENDIAN)
+            val codecId = buffer.getInt(0)
+            if (codecId == 0) throw IOException("o servidor desativou a transmissão de vídeo")
+            if (codecId != H264_FOURCC) {
+                throw IOException("codec de vídeo inesperado: 0x${codecId.toString(16)}")
+            }
+            val width = buffer.getInt(68)
+            val height = buffer.getInt(72)
             if (width <= 0 || height <= 0) {
                 throw IOException("dimensões de vídeo inválidas: ${width}x${height}")
             }
@@ -491,7 +518,10 @@ class ScrcpyClient(
             val reader = ByteBuffer.allocate(12).order(ByteOrder.BIG_ENDIAN)
             try {
                 while (isActive && token == generation && !stream.isClosed) {
-                    readFully(stream, header, 0, header.size, token)
+                    val headerRead = withStreamGuard(stream, VIDEO_READ_TIMEOUT_MS) {
+                        readFully(stream, header, 0, header.size, token)
+                    }
+                    if (headerRead == null) throw IOException("tempo esgotado lendo cabeçalho de vídeo")
                     reader.clear()
                     reader.put(header)
                     val packedPts = reader.getLong(0)
@@ -500,7 +530,10 @@ class ScrcpyClient(
                         throw IOException("tamanho de pacote de vídeo inválido: $size")
                     }
                     val payload = ByteArray(size)
-                    readFully(stream, payload, 0, size, token)
+                    val payloadRead = withStreamGuard(stream, VIDEO_READ_TIMEOUT_MS) {
+                        readFully(stream, payload, 0, size, token)
+                    }
+                    if (payloadRead == null) throw IOException("tempo esgotado lendo dados de vídeo")
                     lastPacketAtMs = SystemClock.elapsedRealtime()
                     val flags = when {
                         packedPts and CONFIG_FLAG != 0L -> MediaCodec.BUFFER_FLAG_CODEC_CONFIG
@@ -516,6 +549,24 @@ class ScrcpyClient(
                 }
             }
         }
+
+    /** AdbStream.read() blocks in Object.wait(); close the stream to actually release it. */
+    private suspend fun <T> withStreamGuard(
+        stream: AdbStream,
+        timeoutMs: Long,
+        block: suspend () -> T,
+    ): T? = coroutineScope {
+        val budget = timeoutMs.coerceAtLeast(1L)
+        val watchdog = launch(Dispatchers.IO) {
+            delay(budget)
+            closeStream(stream)
+        }
+        try {
+            withTimeoutOrNull(budget) { block() }
+        } finally {
+            watchdog.cancel()
+        }
+    }
 
     private suspend fun readFully(
         stream: AdbStream,
@@ -681,19 +732,19 @@ class ScrcpyClient(
         val host = adb.host.value
         if (rootFixesHost == host) return
         onProgress?.invoke("Aplicando ajustes de vídeo (root)…")
-        val surfaceFix = runPrivileged("service call SurfaceFlinger 1008 i32 1", 20_000L)
+        val surfaceFix = runPrivileged("service call SurfaceFlinger 1008 i32 1", 5_000L)
         if (!surfaceFix.ok) return
-        val property = runPrivileged("getprop vendor.media.c2.vdec.support", 12_000L)
+        val property = runPrivileged("getprop vendor.media.c2.vdec.support", 4_000L)
         if (property.stdout.trim() != "false") {
             runPrivileged(
                 "setprop vendor.media.c2.vdec.support false && " +
                     "setprop ctl.restart android-hardware-media-c2-hal-1-2 && " +
                     "setprop ctl.restart media",
-                45_000L,
+                12_000L,
             )
-            delay(500L)
+            delay(1_500L)
         }
-        runPrivileged("pkill -f 'com.genymobile.scrcpy.Serve[r]' 2>/dev/null; echo ok", 12_000L)
+        runPrivileged("pkill -f 'com.genymobile.scrcpy.Serve[r]' 2>/dev/null; echo ok", 5_000L)
         rootFixesHost = host
     }
 
@@ -742,7 +793,17 @@ class ScrcpyClient(
             }
         }
         val fallback = adb.shell(command, timeoutMs)
-        return PrivilegedResult(fallback.ok, fallback.stdout, fallback.stderr)
+        return PrivilegedResult(
+            ok = fallback.ok && !privilegedFailure(fallback.stdout, fallback.stderr),
+            stdout = fallback.stdout,
+            stderr = fallback.stderr,
+        )
+    }
+
+    private fun privilegedFailure(stdout: String, stderr: String): Boolean {
+        val text = "$stdout $stderr".lowercase(Locale.ROOT)
+        return listOf("permission", "denied", "exception", "error", "not found", "failed")
+            .any { text.contains(it) }
     }
 
     private fun Any.toPrivilegedResult(): PrivilegedResult {
@@ -750,10 +811,13 @@ class ScrcpyClient(
             javaClass.methods.firstOrNull { it.name == name && it.parameterCount == 0 }?.invoke(this)
         }.getOrNull() ?: runCatching { javaClass.getField(name).get(this) }.getOrNull()
 
+        val stdout = (read("getStdout") ?: read("stdout")) as? String ?: ""
+        val stderr = (read("getStderr") ?: read("stderr")) as? String ?: ""
+        val ok = (read("getOk") ?: read("ok")) as? Boolean ?: false
         return PrivilegedResult(
-            ok = (read("getOk") ?: read("ok")) as? Boolean ?: false,
-            stdout = (read("getStdout") ?: read("stdout")) as? String ?: "",
-            stderr = (read("getStderr") ?: read("stderr")) as? String ?: "",
+            ok = ok && !privilegedFailure(stdout, stderr),
+            stdout = stdout,
+            stderr = stderr,
         )
     }
 
@@ -836,12 +900,16 @@ class ScrcpyClient(
             "https://github.com/Genymobile/scrcpy/releases/download/v2.7/scrcpy-server-v2.7"
         const val MIN_JAR_SIZE = 10_000
         const val MAX_LOG_CHARS = 16_384
+        const val SESSION_START_TIMEOUT_MS = 45_000L
         const val STREAM_TIMEOUT_MS = 12_000L
-        const val FIRST_FRAME_TIMEOUT_MS = 8_000L
-        const val MAX_PACKET_SIZE = 64 * 1024 * 1024
+        const val FIRST_FRAME_TIMEOUT_MS = 12_000L
+        const val VIDEO_READ_TIMEOUT_MS = 8_000L
+        const val MAX_PACKET_SIZE = 8 * 1024 * 1024
+        const val H264_FOURCC = 0x6832_3634
         const val MAX_TEXT_BYTES = 260
         const val ADAPT_COOLDOWN_MS = 8_000L
         const val STALL_MS = 2_800L
+        const val KEY_EVENT_BYTES = 14
         const val TYPE_KEY = 0
         const val TYPE_TEXT = 1
         const val TYPE_TOUCH = 2

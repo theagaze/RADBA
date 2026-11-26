@@ -44,6 +44,9 @@ class VideoDecoder : Closeable {
     private var expectKeyFrame = false
 
     @Volatile
+    private var expectKeyFrameSinceMs = 0L
+
+    @Volatile
     private var endOfStream = false
 
     @Volatile
@@ -54,6 +57,9 @@ class VideoDecoder : Closeable {
 
     @Volatile
     private var mimeType: String = MediaFormat.MIMETYPE_VIDEO_AVC
+
+    @Volatile
+    private var softwareDecoder = false
 
     @Volatile
     private var lastFedAtMs = 0L
@@ -80,12 +86,14 @@ class VideoDecoder : Closeable {
         width: Int,
         height: Int,
         mimeType: String = MediaFormat.MIMETYPE_VIDEO_AVC,
+        softwareDecoder: Boolean = false,
     ) {
         if (closed) return
         surfaceRef = surface
         this.width = width.coerceAtLeast(1)
         this.height = height.coerceAtLeast(1)
         this.mimeType = mimeType
+        this.softwareDecoder = softwareDecoder
         startThread()
     }
 
@@ -95,12 +103,14 @@ class VideoDecoder : Closeable {
         surfaceRef = surface
         surfaceGeneration++
         expectKeyFrame = true
+        expectKeyFrameSinceMs = SystemClock.elapsedRealtime()
         synchronized(lock) { (lock as java.lang.Object).notifyAll() }
     }
 
     /** Drop non-intra frames until the next key frame (useful after reattach). */
     fun expectKeyFrame() {
         expectKeyFrame = true
+        expectKeyFrameSinceMs = SystemClock.elapsedRealtime()
     }
 
     /** Queue one encoded access unit. [flags] use MediaCodec.BUFFER_FLAG_*. */
@@ -109,13 +119,27 @@ class VideoDecoder : Closeable {
         lastFedAtMs = SystemClock.elapsedRealtime()
         val isConfig = flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
         val isKey = flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
-        if (expectKeyFrame && !isConfig && !isKey) return
+        if (expectKeyFrame && !isConfig && !isKey) {
+            // Do not stay black forever if this encoder does not mark keyframes.
+            if (SystemClock.elapsedRealtime() - expectKeyFrameSinceMs < KEYFRAME_GRACE_MS) return
+            expectKeyFrame = false
+        }
         if (isKey) expectKeyFrame = false
         if (isConfig) {
             synchronized(lock) { lastConfig = EncodedPacket(data.copyOf(), flags, ptsUs) }
         }
         synchronized(lock) {
-            if (packets.size >= MAX_PENDING) packets.removeFirst()
+            if (packets.size >= MAX_PENDING) {
+                val iterator = packets.iterator()
+                var removed = false
+                while (iterator.hasNext() && !removed) {
+                    if (!isCritical(iterator.next())) {
+                        iterator.remove()
+                        removed = true
+                    }
+                }
+                if (!removed) packets.removeFirst()
+            }
             packets.addLast(EncodedPacket(data.copyOf(), flags, ptsUs))
             (lock as java.lang.Object).notifyAll()
         }
@@ -350,15 +374,33 @@ class VideoDecoder : Closeable {
         val format = MediaFormat.createVideoFormat(mime, width, height).apply {
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_INPUT_SIZE)
         }
-        val codec = MediaCodec.createDecoderByType(mime)
-        try {
-            codec.configure(format, surface, null, 0)
-            codec.start()
-            return codec
-        } catch (t: Throwable) {
-            releaseCodec(codec)
-            throw t
+        val candidates = if (softwareDecoder) {
+            listOf(SOFTWARE_DECODER_C2, SOFTWARE_DECODER_OMX, null)
+        } else {
+            listOf(null, SOFTWARE_DECODER_C2, SOFTWARE_DECODER_OMX)
         }
+        var lastFailure: Throwable? = null
+        for (name in candidates) {
+            val codec = try {
+                if (name == null) {
+                    MediaCodec.createDecoderByType(mime)
+                } else {
+                    MediaCodec.createByCodecName(name)
+                }
+            } catch (t: Throwable) {
+                lastFailure = t
+                null
+            } ?: continue
+            try {
+                codec.configure(format, surface, null, 0)
+                codec.start()
+                return codec
+            } catch (t: Throwable) {
+                lastFailure = t
+                releaseCodec(codec)
+            }
+        }
+        throw lastFailure ?: IOException("nenhum decodificador H.264 disponível")
     }
 
     private fun handleCodecFailure(t: Throwable) {
@@ -390,13 +432,20 @@ class VideoDecoder : Closeable {
         }
     }
 
+    private fun isCritical(packet: EncodedPacket): Boolean =
+        (packet.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0 ||
+            (packet.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+
     private data class EncodedPacket(val data: ByteArray, val flags: Int, val ptsUs: Long)
 
     private companion object {
         const val INPUT_TIMEOUT_US = 20_000L
         const val OUTPUT_TIMEOUT_US = 2_000L
         const val MAX_INPUT_SIZE = 8 * 1024 * 1024
+        const val SOFTWARE_DECODER_C2 = "c2.android.avc.decoder"
+        const val SOFTWARE_DECODER_OMX = "OMX.google.h264.decoder"
         const val MAX_PENDING = 48
+        const val KEYFRAME_GRACE_MS = 1_500L
         const val MAX_ENQUEUE_ATTEMPTS = 5_000
     }
 }

@@ -27,13 +27,13 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarVisuals
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -278,22 +278,35 @@ fun GlassSheet(
     }
 }
 
+private data class RadbaSnackbarVisuals(
+    override val message: String,
+    val toastKind: ToastKind,
+    override val duration: SnackbarDuration,
+    override val actionLabel: String? = null,
+    override val withDismissAction: Boolean = false,
+) : SnackbarVisuals
+
 /** Overlay global de toasts vindos do ViewModel. */
 @Composable
 fun ToastHost(toasts: Flow<ToastMessage>, modifier: Modifier = Modifier) {
     val hostState = remember { SnackbarHostState() }
-    val kind = remember { mutableStateOf(ToastKind.INFO) }
     LaunchedEffect(toasts) {
         toasts.collect { message ->
-            kind.value = message.kind
             hostState.showSnackbar(
-                message = message.text,
-                duration = if (message.kind == ToastKind.ERROR) SnackbarDuration.Long else SnackbarDuration.Short,
+                RadbaSnackbarVisuals(
+                    message = message.text,
+                    toastKind = message.kind,
+                    duration = if (message.kind == ToastKind.ERROR) {
+                        SnackbarDuration.Long
+                    } else {
+                        SnackbarDuration.Short
+                    },
+                ),
             )
         }
     }
     SnackbarHost(hostState = hostState, modifier = modifier) { data ->
-        val accent = when (kind.value) {
+        val accent = when ((data.visuals as? RadbaSnackbarVisuals)?.toastKind ?: ToastKind.INFO) {
             ToastKind.OK -> GlassColors.ok
             ToastKind.ERROR -> GlassColors.bad
             ToastKind.INFO -> GlassColors.acc

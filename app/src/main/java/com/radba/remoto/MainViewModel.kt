@@ -33,6 +33,7 @@ import com.radba.remoto.data.TerminalKind
 import com.radba.remoto.data.TerminalLine
 import com.radba.remoto.data.ToastKind
 import com.radba.remoto.data.ToastMessage
+import com.radba.remoto.scrcpy.MirrorState as ScrcpyMirrorState
 import com.radba.remoto.scrcpy.ScrcpyClient
 import com.radba.remoto.util.clampInt
 import com.radba.remoto.util.inputTextCommand
@@ -70,6 +71,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 private val DISPLAY_SIZE_REGEX = Regex("""(\d+)\s*[xX]\s*(\d+)""")
 
 private const val TOUCH_HOVER = 7
+private const val MIRROR_START_TIMEOUT_MS = 45_000L
+private const val MIRROR_NO_FRAME_TIMEOUT_MS = 20_000L
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     data class UiState(
@@ -93,6 +96,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val terminalBusy: Boolean = false,
         val mirrorState: MirrorState = MirrorState.OFF,
         val mirrorError: String = "",
+        val mirrorProgress: String = "",
+        val mirrorFrameAgeMs: Long = -1L,
         val mirrorTier: String = "60 FPS Fluido",
         val mirrorFps: Int = 0,
         val mirrorLatencyMs: Int = 0,
@@ -128,7 +133,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<UiState> = _ui.asStateFlow()
 
     private val _toasts = MutableSharedFlow<ToastMessage>(
-        extraBufferCapacity = 128,
+        extraBufferCapacity = 8,
         onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
     )
     val toasts: SharedFlow<ToastMessage> = _toasts.asSharedFlow()
@@ -150,9 +155,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var volumeHoldUntilMs = 0L
     private var lastVdimErrorMs = 0L
     private var mirrorRetryAfterMs = 0L
+    private var mirrorAttemptId = 0
+    private var mirrorBusySinceMs = 0L
     private var lastOnline: Boolean? = false
     private var lastOrientation = -1
     private var pendingOrientationRestart = false
+
+    @Volatile
+    private var lastMirrorFrameAtMs = 0L
+
+    @Volatile
+    private var mirrorSurfaceToken: Any? = null
 
     @Volatile
     private var viewWidth = 0
@@ -192,16 +205,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch {
             scrcpy.state.collect { scrcpyState ->
-                val mapped = when (scrcpyState.name) {
-                    "STARTING" -> MirrorState.STARTING
-                    "ON" -> MirrorState.ON
-                    else -> MirrorState.OFF
+                val mapped = when (scrcpyState) {
+                    ScrcpyMirrorState.STARTING -> MirrorState.STARTING
+                    ScrcpyMirrorState.ON -> MirrorState.ON
+                    ScrcpyMirrorState.OFF -> MirrorState.OFF
                 }
-                _ui.update { it.copy(mirrorState = mapped) }
+                _ui.update {
+                    it.copy(
+                        mirrorState = mapped,
+                        mirrorError = if (mapped == MirrorState.ON) "" else it.mirrorError,
+                        mirrorProgress = if (mapped == MirrorState.ON) "" else it.mirrorProgress,
+                    )
+                }
             }
         }
         viewModelScope.launch {
-            scrcpy.error.collect { error -> _ui.update { it.copy(mirrorError = error) } }
+            scrcpy.error.collect { error ->
+                if (error.isNotBlank()) {
+                    _ui.update { it.copy(mirrorError = error) }
+                }
+            }
         }
         viewModelScope.launch {
             scrcpy.mirrorStats.collect { stats ->
@@ -234,6 +257,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         periodic(2_000L) {
             if (_ui.value.tab == Tab.PERF && adb.online.value) refreshPerfInternal()
         }
+        periodic(1_000L) { mirrorWatchdog() }
         periodic(2_500L) { ensureMirrorInternal() }
         periodic(4_000L) { fourSecondTick() }
         periodic(5_000L) { fiveSecondTick() }
@@ -358,12 +382,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             coalescedJobs.keys.toList().forEach { coalescedJobs[it]?.cancel() }
             coalescedJobs.clear()
             mirrorRetryAfterMs = 0L
+            mirrorAttemptId++
+            mirrorBusySinceMs = 0L
+            lastMirrorFrameAtMs = 0L
             _ui.update {
                 it.copy(
                     connection = ConnectionState.DISCONNECTED,
                     connectionText = "Desconectado",
                     mirrorState = MirrorState.OFF,
                     mirrorError = "",
+                    mirrorProgress = "",
+                    mirrorFrameAgeMs = -1L,
                     mirrorBusy = false,
                     rootStatus = RootStatus(),
                     screenshot = null,
@@ -540,7 +569,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // ------------------------------------------------------------ espelho --
 
     fun attachMirrorSurface(surface: Surface?) {
+        mirrorSurfaceToken = surface
+        lastMirrorFrameAtMs = 0L
         scrcpy.attachSurface(surface)
+        _ui.update { it.copy(mirrorFrameAgeMs = -1L) }
+    }
+
+    /** A late destroy callback from an old view must not detach the new surface. */
+    fun detachMirrorSurface(surface: Surface?) {
+        if (surface != null && surface !== mirrorSurfaceToken) return
+        mirrorSurfaceToken = null
+        lastMirrorFrameAtMs = 0L
+        scrcpy.attachSurface(null)
+        _ui.update { it.copy(mirrorFrameAgeMs = -1L) }
+    }
+
+    fun noteMirrorFrame() {
+        lastMirrorFrameAtMs = SystemClock.elapsedRealtime()
     }
 
     fun updateMirrorView(width: Int, height: Int) {
@@ -562,55 +607,136 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun handleMirrorProgress(attempt: Int, message: String) {
+        note(message, ToastKind.INFO)
+        if (attempt == mirrorAttemptId) {
+            _ui.update { it.copy(mirrorProgress = trunc(message, 120)) }
+        }
+    }
+
+    private suspend fun mirrorWatchdog() {
+        val now = SystemClock.elapsedRealtime()
+        val frameAge = if (lastMirrorFrameAtMs > 0L) {
+            (now - lastMirrorFrameAtMs).coerceAtLeast(0L)
+        } else {
+            -1L
+        }
+        _ui.update { it.copy(mirrorFrameAgeMs = frameAge) }
+        val state = _ui.value
+        if (!state.prefs.mirror) return
+
+        if (state.mirrorBusy || state.mirrorState == MirrorState.STARTING) {
+            val since = mirrorBusySinceMs
+            if (since <= 0L || now - since <= MIRROR_START_TIMEOUT_MS) return
+            mirrorAttemptId++
+            mirrorBusySinceMs = 0L
+            mirrorRetryAfterMs = now + 2_500L
+            scrcpy.stop()
+            val message = "O espelho demorou para iniciar; tentando novamente."
+            _ui.update {
+                it.copy(
+                    mirrorState = MirrorState.OFF,
+                    mirrorBusy = false,
+                    mirrorError = message,
+                    mirrorProgress = "",
+                )
+            }
+            noteAndToast(message, ToastKind.ERROR)
+            consumePendingOrientationRestart()
+            return
+        }
+
+        if (state.mirrorState == MirrorState.ON &&
+            frameAge > MIRROR_NO_FRAME_TIMEOUT_MS &&
+            now >= mirrorRetryAfterMs
+        ) {
+            mirrorRetryAfterMs = now + 5_000L
+            noteAndToast("Sem frames no espelho; reiniciando…", ToastKind.ERROR)
+            safeLaunch { restartMirrorInternal(announce = false) }
+        }
+    }
+
     private suspend fun ensureMirrorInternal() {
         val state = _ui.value
         if (!state.prefs.mirror || !adb.online.value) return
         if (scrcpy.isReady() || state.mirrorBusy) return
-        if (SystemClock.elapsedRealtime() < mirrorRetryAfterMs) return
-        _ui.update { it.copy(mirrorBusy = true) }
+        val now = SystemClock.elapsedRealtime()
+        if (now < mirrorRetryAfterMs) return
+        val attempt = ++mirrorAttemptId
+        mirrorBusySinceMs = now
+        _ui.update {
+            it.copy(mirrorBusy = true, mirrorError = "", mirrorProgress = "Iniciando scrcpy…")
+        }
         try {
-            val ok = scrcpy.start { message -> note(message, ToastKind.INFO) }
-            if (ok && _ui.value.blackout) scrcpy.setDisplayPower(false)
-            if (!ok) mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
+            val ok = scrcpy.start { message -> handleMirrorProgress(attempt, message) }
+            if (attempt != mirrorAttemptId) return
+            if (ok) {
+                _ui.update { it.copy(mirrorError = "", mirrorProgress = "") }
+                if (_ui.value.blackout) scrcpy.setDisplayPower(false)
+            } else {
+                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
+                val reason = scrcpy.error.value.ifBlank { "espelho não iniciou" }
+                _ui.update { it.copy(mirrorError = reason, mirrorProgress = "") }
+                note("Espelho: ${trunc(reason, 140)}", ToastKind.ERROR)
+            }
             refreshScreenshot()
         } catch (t: Throwable) {
-            mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
-            toast("Espelho: ${trunc(t.message ?: "falha", 70)}", ToastKind.ERROR)
+            if (attempt == mirrorAttemptId) {
+                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
+                val reason = trunc(t.message ?: "falha", 140)
+                _ui.update { it.copy(mirrorError = reason, mirrorProgress = "") }
+                note("Espelho: $reason", ToastKind.ERROR)
+            }
         } finally {
-            _ui.update { it.copy(mirrorBusy = false) }
-            consumePendingOrientationRestart()
+            if (attempt == mirrorAttemptId) {
+                mirrorBusySinceMs = 0L
+                _ui.update { it.copy(mirrorBusy = false) }
+                consumePendingOrientationRestart()
+            }
         }
     }
 
     private suspend fun restartMirrorInternal(announce: Boolean) {
         if (!adb.online.value || _ui.value.mirrorBusy) return
-        _ui.update { it.copy(mirrorBusy = true) }
+        val attempt = ++mirrorAttemptId
+        mirrorBusySinceMs = SystemClock.elapsedRealtime()
+        _ui.update {
+            it.copy(mirrorBusy = true, mirrorError = "", mirrorProgress = "Reiniciando scrcpy…")
+        }
         if (announce) note("Iniciando transmissão melhorada…", ToastKind.INFO)
         try {
             scrcpy.stop()
-            val ok = scrcpy.start { message -> note(message, ToastKind.INFO) }
-            if (ok && _ui.value.blackout) scrcpy.setDisplayPower(false)
-            if (!ok) {
-                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
+            val ok = scrcpy.start { message -> handleMirrorProgress(attempt, message) }
+            if (attempt != mirrorAttemptId) return
+            if (ok) {
+                _ui.update { it.copy(mirrorError = "", mirrorProgress = "") }
+                if (_ui.value.blackout) scrcpy.setDisplayPower(false)
                 if (announce) {
-                    val reason = scrcpy.error.value.ifBlank { "motivo desconhecido" }
-                    note("Espelho falhou: ${trunc(reason, 320)}", ToastKind.ERROR)
-                    toast("Espelho falhou (detalhes em Ajustes).", ToastKind.ERROR)
+                    note("Transmissão melhorada ativa. Veja na tela Início.", ToastKind.OK)
+                    toast("Espelho ativo.", ToastKind.OK)
                 }
-            } else if (announce) {
-                note("Transmissão melhorada ativa. Veja na tela Início.", ToastKind.OK)
-                toast("Espelho ativo.", ToastKind.OK)
+            } else {
+                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
+                val reason = scrcpy.error.value.ifBlank { "motivo desconhecido" }
+                _ui.update { it.copy(mirrorError = reason, mirrorProgress = "") }
+                note("Espelho falhou: ${trunc(reason, 320)}", ToastKind.ERROR)
+                if (announce) toast("Espelho falhou (detalhes em Ajustes).", ToastKind.ERROR)
             }
         } catch (t: Throwable) {
-            mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
-            if (announce) {
-                note("Espelho falhou: ${trunc(failureDetail(t), 320)}", ToastKind.ERROR)
-                toast("Espelho falhou (detalhes em Ajustes).", ToastKind.ERROR)
+            if (attempt == mirrorAttemptId) {
+                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
+                val reason = trunc(failureDetail(t), 320)
+                _ui.update { it.copy(mirrorError = reason, mirrorProgress = "") }
+                note("Espelho falhou: $reason", ToastKind.ERROR)
+                if (announce) toast("Espelho falhou (detalhes em Ajustes).", ToastKind.ERROR)
             }
         } finally {
-            _ui.update { it.copy(mirrorBusy = false) }
-            refreshScreenshot()
-            consumePendingOrientationRestart()
+            if (attempt == mirrorAttemptId) {
+                mirrorBusySinceMs = 0L
+                _ui.update { it.copy(mirrorBusy = false) }
+                refreshScreenshot()
+                consumePendingOrientationRestart()
+            }
         }
     }
 
@@ -620,7 +746,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         if (_ui.value.mirrorBusy) {
-            note("O espelho já está iniciando…", ToastKind.INFO)
+            noteAndToast("O espelho já está iniciando…", ToastKind.INFO)
             return
         }
         if (!_ui.value.prefs.mirror) {
@@ -636,9 +762,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun stopMirror() {
+        mirrorAttemptId++
+        mirrorBusySinceMs = 0L
         scrcpy.stop()
         mirrorRetryAfterMs = 0L
-        _ui.update { it.copy(mirrorState = MirrorState.OFF, mirrorBusy = false) }
+        lastMirrorFrameAtMs = 0L
+        _ui.update {
+            it.copy(
+                mirrorState = MirrorState.OFF,
+                mirrorBusy = false,
+                mirrorError = "",
+                mirrorProgress = "",
+                mirrorFrameAgeMs = -1L,
+            )
+        }
         toast("Espelho desligado.", ToastKind.INFO)
         safeLaunch { refreshScreenshot() }
     }

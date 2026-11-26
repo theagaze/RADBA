@@ -1,6 +1,8 @@
 package com.radba.remoto.ui.screens
 
 import android.graphics.SurfaceTexture
+import android.os.Handler
+import android.os.Looper
 import android.view.KeyEvent
 import android.view.Surface
 import android.view.TextureView
@@ -77,22 +79,26 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
     var controlsExpanded by remember { mutableStateOf(true) }
 
     val mirrorOn = state.mirrorState == MirrorState.ON
+    val waitingFrame = mirrorOn &&
+        (state.mirrorFrameAgeMs < 0L || state.mirrorFrameAgeMs > 3_000L)
     val showShot = state.mirrorState == MirrorState.OFF &&
         !state.prefs.mirror && state.screenshot != null
+    val progress = state.mirrorProgress.ifBlank { "Preparando transmissão…" }
 
     val stageMessage = when {
         state.connection == ConnectionState.DISCONNECTED -> "Projetor desconectado"
+        waitingFrame -> "Aguardando primeiro frame…\n${trunc(progress, 110)}"
+        mirrorOn -> null
         state.prefs.mirror && state.mirrorError.isNotBlank() ->
             "Transmissão melhorada (scrcpy) reconectando…\n${trunc(state.mirrorError, 90)}"
-        mirrorOn -> null
-        state.prefs.mirror -> "Iniciando transmissão melhorada (scrcpy)…"
+        state.prefs.mirror -> "Iniciando transmissão melhorada (scrcpy)…\n${trunc(progress, 110)}"
         state.screenshot != null -> null
         else -> state.screenshotStatus.ifBlank { "Aguardando conexão…" }
     }
 
     val status = when {
         state.connection == ConnectionState.DISCONNECTED -> "Desconectado"
-        state.prefs.mirror && state.mirrorError.isNotBlank() -> "Reconectando scrcpy…"
+        waitingFrame -> "Aguardando primeiro frame…"
         mirrorOn -> buildString {
             append("scrcpy · ")
             if (state.mirrorFps >= 1) {
@@ -102,7 +108,8 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
             }
             if (state.mirrorLatencyMs > 0) append(" · ").append(state.mirrorLatencyMs).append("ms")
         }
-        state.prefs.mirror -> "Iniciando scrcpy…"
+        state.prefs.mirror && state.mirrorError.isNotBlank() -> "Reconectando scrcpy…"
+        state.prefs.mirror -> trunc(progress, 52)
         else -> state.screenshotStatus.ifBlank { "Aguardando…" }
     }
 
@@ -158,7 +165,11 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                                     viewModel.attachMirrorSurface(next)
                                     viewModel.updateMirrorView(width, height)
                                     viewModel.ensureMirror()
-                                    previous?.release()
+                                    if (previous != null && previous !== next) {
+                                        Handler(Looper.getMainLooper()).postDelayed({
+                                            runCatching { previous.release() }
+                                        }, 500L)
+                                    }
                                 }
                             }
 
@@ -174,13 +185,20 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                             }
 
                             override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
-                                runCatching { viewModel.attachMirrorSurface(null) }
-                                mirrorSurface?.release()
+                                val previous = mirrorSurface
+                                runCatching { viewModel.detachMirrorSurface(previous) }
+                                if (previous != null) {
+                                    Handler(Looper.getMainLooper()).postDelayed({
+                                        runCatching { previous.release() }
+                                    }, 500L)
+                                }
                                 mirrorSurface = null
                                 return true
                             }
 
-                            override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) = Unit
+                            override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) {
+                                viewModel.noteMirrorFrame()
+                            }
                         }
                     }
                 },
@@ -222,7 +240,7 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
             ) {
                 Text(
                     text = status,
-                    color = if (state.mirrorError.isNotBlank() && state.prefs.mirror) {
+                    color = if (waitingFrame || (state.mirrorError.isNotBlank() && state.prefs.mirror)) {
                         GlassColors.warn
                     } else {
                         GlassColors.sub

@@ -11,9 +11,11 @@ import com.radba.remoto.util.splitHost
 import com.radba.remoto.util.trunc
 import io.github.muntashirakon.adb.AdbStream
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
@@ -21,6 +23,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.File
@@ -29,6 +32,8 @@ import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+
+private const val ADB_OPEN_TIMEOUT_MS = 8_000L
 
 data class ShellResult(val exitCode: Int, val stdout: String, val stderr: String) {
     val ok: Boolean get() = exitCode == 0
@@ -156,11 +161,30 @@ class AdbManager(context: Context) : Closeable {
         monitorJob = null
     }
 
+    /**
+     * libadb waits on Object.wait() inside openStream without a timeout and holds
+     * its manager lock. Run it on an interruptible thread so a dead adbd cannot
+     * freeze every later ADB operation.
+     */
     suspend fun openStream(destination: String): AdbStream = withContext(Dispatchers.IO) {
         val connection = manager
             ?: throw IOException("Cliente ADB não inicializado")
         if (!connection.isConnected) throw IOException("ADB desconectado")
-        connection.openStream(destination)
+        val deferred = CompletableDeferred<AdbStream>()
+        val opener = Thread({
+            try {
+                deferred.complete(connection.openStream(destination))
+            } catch (error: Throwable) {
+                deferred.completeExceptionally(error)
+            }
+        }, "adb-open").apply { isDaemon = true }
+        opener.start()
+        try {
+            withTimeout(ADB_OPEN_TIMEOUT_MS) { deferred.await() }
+        } catch (error: TimeoutCancellationException) {
+            opener.interrupt()
+            throw IOException("tempo esgotado ao abrir stream ADB: $destination")
+        }
     }
 
     suspend fun shell(command: String, timeoutMs: Long = 60_000): ShellResult =
@@ -254,19 +278,19 @@ class AdbManager(context: Context) : Closeable {
             var mode: String? = null
             var detail = "acesso root indisponível"
 
-            val direct = shell("id -u 2>/dev/null || id", 10_000)
+            val direct = shell("id -u 2>/dev/null || id", 5_000)
             val directOut = direct.stdout.trim()
             if (direct.ok && (directOut == "0" || directOut.contains("uid=0"))) {
                 mode = "direct"
                 detail = "uid=0 (adbd root)"
             } else {
-                val su = shell("su -c ${shellQuote("id")}", 10_000)
+                val su = shell("su -c ${shellQuote("id")}", 5_000)
                 val suOut = su.stdout.trim()
                 if (su.ok && suOut.contains("uid=0")) {
                     mode = "su"
                     detail = "su -c (uid=0)"
                 } else {
-                    val su0 = shell("su 0 sh -c ${shellQuote("id")}", 10_000)
+                    val su0 = shell("su 0 sh -c ${shellQuote("id")}", 5_000)
                     val su0Out = su0.stdout.trim()
                     if (su0.ok && su0Out.contains("uid=0")) {
                         mode = "su0"
