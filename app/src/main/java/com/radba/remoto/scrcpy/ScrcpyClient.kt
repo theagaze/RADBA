@@ -516,14 +516,17 @@ class ScrcpyClient(
             }
             val controlStream = control ?: throw IOException("tempo esgotado ao abrir o stream de controle")
 
-            // 64-byte device name + codecId/width/height, all big endian.
+            // Layout on the video socket: 64-byte device name, then the
+            // 12-byte codec header (codecId/width/height), all big endian.
+            // Device.getDeviceName() is Build.MODEL, so the name is only
+            // NUL-padded up to 64 bytes; the codec id starts at offset 64.
             val meta = ByteArray(76)
             val metaRead = withStreamGuard(videoStream, remaining()) {
                 readFully(videoStream, meta, 0, meta.size, token)
             }
             if (metaRead == null) throw IOException("tempo esgotado ao ler metadados de vídeo")
             val buffer = ByteBuffer.wrap(meta).order(ByteOrder.BIG_ENDIAN)
-            val codecId = buffer.getInt(0)
+            val codecId = buffer.getInt(64)
             if (codecId == 0) throw IOException("o servidor desativou a transmissão de vídeo")
             if (codecId != H264_FOURCC) {
                 throw IOException("codec de vídeo inesperado: 0x${codecId.toString(16)}")
