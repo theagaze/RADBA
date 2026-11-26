@@ -7,7 +7,7 @@ import android.view.Surface
 import com.radba.remoto.adb.AdbManager
 import com.radba.remoto.data.MirrorStats
 import com.radba.remoto.data.Prefs
-import com.radba.remoto.data.VideoTier
+import com.radba.remoto.util.VideoTier
 import com.radba.remoto.util.VIDEO_TIERS
 import com.radba.remoto.util.encoderPlan
 import io.github.muntashirakon.adb.AdbStream
