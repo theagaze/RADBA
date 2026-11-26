@@ -115,7 +115,11 @@ class AdbManager(context: Context) : Closeable {
         connect(host.value)
     }
 
-    fun startMonitor(scope: CoroutineScope, onStatus: (Boolean) -> Unit) {
+    fun startMonitor(
+        scope: CoroutineScope,
+        controlAlive: () -> Boolean = { false },
+        onStatus: (Boolean) -> Unit,
+    ) {
         stopMonitor()
         var lastEmitted: Boolean? = null
         var lastPing = 0L
@@ -125,9 +129,10 @@ class AdbManager(context: Context) : Closeable {
             while (isActive) {
                 val now = System.currentTimeMillis()
                 val connected = online.value && manager?.isConnected == true
+                val controlLive = runCatching { controlAlive() }.getOrDefault(false)
                 if (!connected && online.value) setOnline(false)
 
-                if (connected && now - lastPing >= 3_000L) {
+                if (connected && !controlLive && now - lastPing >= 3_000L) {
                     lastPing = now
                     val probe = shell("echo ok", 8_000)
                     if (!probe.ok || !probe.stdout.contains("ok")) {
@@ -139,7 +144,7 @@ class AdbManager(context: Context) : Closeable {
                     lastReconnect = now
                     reconnect()
                 }
-                if (online.value && now - lastWatchdog >= 20_000L) {
+                if (online.value && !controlLive && now - lastWatchdog >= 20_000L) {
                     lastWatchdog = now
                     val probe = shell("echo watchdog", 10_000)
                     if (!probe.ok || !probe.stdout.contains("watchdog")) {

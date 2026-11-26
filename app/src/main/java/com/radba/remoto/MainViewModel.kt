@@ -71,7 +71,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 private val DISPLAY_SIZE_REGEX = Regex("""(\d+)\s*[xX]\s*(\d+)""")
 
 private const val TOUCH_HOVER = 7
-private const val MIRROR_START_TIMEOUT_MS = 45_000L
+private const val MIRROR_START_TIMEOUT_MS = 210_000L
 private const val MIRROR_NO_FRAME_TIMEOUT_MS = 12_000L
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -157,6 +157,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var mirrorRetryAfterMs = 0L
     private var mirrorAttemptId = 0
     private var mirrorBusySinceMs = 0L
+    private var mirrorFailStreak = 0
     private var lastOnline: Boolean? = false
     private var lastOrientation = -1
     private var pendingOrientationRestart = false
@@ -184,7 +185,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         adb.setHost(prefsFlow.value.host)
-        adb.startMonitor(viewModelScope) { ok -> adb.online.value = ok }
+        adb.startMonitor(viewModelScope, controlAlive = { scrcpy.isControlReady() }) { ok ->
+            adb.online.value = ok
+        }
 
         viewModelScope.launch {
             prefsFlow.collect { p ->
@@ -259,9 +262,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         periodic(1_000L) { mirrorWatchdog() }
         periodic(2_500L) { ensureMirrorInternal() }
+        periodic(3_000L) { ensureControlInternal() }
         periodic(4_000L) { fourSecondTick() }
         periodic(5_000L) { fiveSecondTick() }
         periodic(15_000L) { refreshVolumeInternal() }
+    }
+
+    override fun onCleared() {
+        adb.stopMonitor()
+        scrcpy.close()
+        adb.close()
+        super.onCleared()
     }
 
     // ------------------------------------------------------------ infra --
@@ -362,6 +373,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             safeLaunch {
+                // Control-only scrcpy session makes keys fast even before video
+                // is ready; it is independent from the video pipeline.
+                safeLaunch { ensureControlInternal() }
                 val rootJob = safeLaunchJob { refreshRootFeatures() }
                 refreshVolumeInternal()
                 refreshSettingsInternal()
@@ -377,8 +391,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         } else {
             scrcpy.stop()
+            scrcpy.stopControl()
             scrcpy.resetTier()
             scrcpy.resetRootFixes()
+            mirrorFailStreak = 0
             coalescedJobs.keys.toList().forEach { coalescedJobs[it]?.cancel() }
             coalescedJobs.clear()
             mirrorRetryAfterMs = 0L
@@ -594,6 +610,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         scrcpy.setViewSize(viewWidth, viewHeight)
     }
 
+    private suspend fun ensureControlInternal() {
+        if (!adb.online.value || scrcpy.isReady() || scrcpy.isControlReady()) return
+        scrcpy.setDisplayOff(_ui.value.blackout)
+        val started = runCatching { scrcpy.startControl() }.getOrDefault(false)
+        if (started && _ui.value.blackout) scrcpy.setDisplayPower(false)
+    }
+
+    private fun mirrorBackoffMs(): Long {
+        mirrorFailStreak = (mirrorFailStreak + 1).coerceAtMost(6)
+        return (2_500L shl (mirrorFailStreak - 1)).coerceAtMost(30_000L)
+    }
+
     /** Surface callbacks restore the stream; they never force a restart. */
     fun ensureMirror() {
         safeLaunch { ensureMirrorInternal() }
@@ -601,6 +629,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun consumePendingOrientationRestart() {
         if (!pendingOrientationRestart) return
+        if (SystemClock.elapsedRealtime() < mirrorRetryAfterMs) return
         pendingOrientationRestart = false
         if (adb.online.value && _ui.value.prefs.mirror) {
             safeLaunch { restartMirrorInternal(announce = false) }
@@ -630,7 +659,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (since <= 0L || now - since <= MIRROR_START_TIMEOUT_MS) return
             mirrorAttemptId++
             mirrorBusySinceMs = 0L
-            mirrorRetryAfterMs = now + 2_500L
+            mirrorRetryAfterMs = now + mirrorBackoffMs()
             scrcpy.stop()
             val message = "O espelho demorou para iniciar; tentando novamente."
             _ui.update {
@@ -677,13 +706,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(mirrorBusy = true, mirrorError = "", mirrorProgress = "Iniciando scrcpy…")
         }
         try {
+            scrcpy.setDisplayOff(_ui.value.blackout)
             val ok = scrcpy.start { message -> handleMirrorProgress(attempt, message) }
             if (attempt != mirrorAttemptId) return
             if (ok) {
+                mirrorFailStreak = 0
                 _ui.update { it.copy(mirrorError = "", mirrorProgress = "") }
                 if (_ui.value.blackout) scrcpy.setDisplayPower(false)
             } else {
-                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
+                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + mirrorBackoffMs()
                 val reason = scrcpy.error.value.ifBlank { "espelho não iniciou" }
                 _ui.update { it.copy(mirrorError = reason, mirrorProgress = "") }
                 note("Espelho: ${trunc(reason, 140)}", ToastKind.ERROR)
@@ -691,7 +722,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             refreshScreenshot()
         } catch (t: Throwable) {
             if (attempt == mirrorAttemptId) {
-                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
+                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + mirrorBackoffMs()
                 val reason = trunc(t.message ?: "falha", 140)
                 _ui.update { it.copy(mirrorError = reason, mirrorProgress = "") }
                 note("Espelho: $reason", ToastKind.ERROR)
@@ -714,10 +745,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (announce) note("Iniciando transmissão melhorada…", ToastKind.INFO)
         try {
+            scrcpy.setDisplayOff(_ui.value.blackout)
             scrcpy.stop()
             val ok = scrcpy.start { message -> handleMirrorProgress(attempt, message) }
             if (attempt != mirrorAttemptId) return
             if (ok) {
+                mirrorFailStreak = 0
                 _ui.update { it.copy(mirrorError = "", mirrorProgress = "") }
                 if (_ui.value.blackout) scrcpy.setDisplayPower(false)
                 if (announce) {
@@ -725,7 +758,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     toast("Espelho ativo.", ToastKind.OK)
                 }
             } else {
-                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
+                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + mirrorBackoffMs()
                 val reason = scrcpy.error.value.ifBlank { "motivo desconhecido" }
                 _ui.update { it.copy(mirrorError = reason, mirrorProgress = "") }
                 note("Espelho falhou: ${trunc(reason, 320)}", ToastKind.ERROR)
@@ -733,7 +766,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         } catch (t: Throwable) {
             if (attempt == mirrorAttemptId) {
-                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
+                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + mirrorBackoffMs()
                 val reason = trunc(failureDetail(t), 320)
                 _ui.update { it.copy(mirrorError = reason, mirrorProgress = "") }
                 note("Espelho falhou: $reason", ToastKind.ERROR)
@@ -773,6 +806,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun stopMirror() {
         mirrorAttemptId++
         mirrorBusySinceMs = 0L
+        mirrorFailStreak = 0
         scrcpy.stop()
         mirrorRetryAfterMs = 0L
         lastMirrorFrameAtMs = 0L
@@ -1116,6 +1150,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             toast("Projetor desconectado.", ToastKind.ERROR)
             return
         }
+        scrcpy.setDisplayOff(on)
         if (on) {
             safeLaunch {
                 val current = if (pq.available) {

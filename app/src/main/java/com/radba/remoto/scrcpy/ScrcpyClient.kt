@@ -27,6 +27,8 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
@@ -112,11 +114,19 @@ class ScrcpyClient(
 
     private val logLock = Any()
     private val serverLog = StringBuilder()
+    private val jarLock = Mutex()
+
+    @Volatile private var displayOff = false
 
     fun attachSurface(surface: Surface?) {
         surfaceRef = surface
         surfaceReady.value = surface != null
         decoder?.attachSurface(surface)
+    }
+
+    /** Keep scrcpy from waking a display that the app intentionally blacked out. */
+    fun setDisplayOff(off: Boolean) {
+        displayOff = off
     }
 
     fun setViewSize(width: Int, height: Int) {
@@ -151,14 +161,11 @@ class ScrcpyClient(
         return try {
             onProgress?.invoke("Preparando servidor scrcpy…")
             val prefs = prefsProvider()
-            val jar = withTimeoutOrNull(30_000L) { prepareServerJar(onProgress) }
-                ?: throw IOException("tempo esgotado ao preparar o servidor scrcpy")
+            prepareAndPushJar(onProgress)
 
             if (prefs.rootFixVideo) {
                 withTimeoutOrNull(ROOT_FIX_BUDGET_MS) { applyRootFixes(onProgress) }
             }
-            val pushed = withTimeoutOrNull(20_000L) { pushJarIfNeeded(jar, onProgress) }
-            if (pushed == null) throw IOException("tempo esgotado ao enviar o servidor scrcpy")
 
             val plan = encoderPlan()
             val tier = currentTier()
@@ -291,7 +298,7 @@ class ScrcpyClient(
     }
 
     fun sendKey(code: Int): Boolean {
-        if (!isReady()) return false
+        if (!canSend()) return false
         val buffer = ByteBuffer.allocate(KEY_EVENT_BYTES * 2).order(ByteOrder.BIG_ENDIAN)
         appendKey(buffer, code, ACTION_DOWN)
         appendKey(buffer, code, ACTION_UP)
@@ -299,7 +306,7 @@ class ScrcpyClient(
     }
 
     fun sendKeys(codes: List<Int>): Boolean {
-        if (!isReady() || codes.isEmpty()) return false
+        if (!canSend() || codes.isEmpty()) return false
         val buffer = ByteBuffer.allocate(codes.size * KEY_EVENT_BYTES * 2).order(ByteOrder.BIG_ENDIAN)
         codes.forEach { code ->
             appendKey(buffer, code, ACTION_DOWN)
@@ -309,7 +316,7 @@ class ScrcpyClient(
     }
 
     fun sendText(text: String): Boolean {
-        if (!isReady()) return false
+        if (!canSend()) return false
         var sent = false
         for (bytes in utf8Chunks(text, MAX_TEXT_BYTES)) {
             val buffer = ByteBuffer.allocate(5 + bytes.size).order(ByteOrder.BIG_ENDIAN)
@@ -345,7 +352,7 @@ class ScrcpyClient(
     }
 
     fun setDisplayPower(on: Boolean): Boolean {
-        if (!isReady()) return false
+        if (!canSend()) return false
         val buffer = ByteBuffer.allocate(2).order(ByteOrder.BIG_ENDIAN)
         buffer.put(TYPE_POWER.toByte())
         buffer.put((if (on) POWER_MODE_NORMAL else POWER_MODE_OFF).toByte())
@@ -365,6 +372,8 @@ class ScrcpyClient(
 
     override fun close() {
         stop()
+        stopControl()
+        runCatching { ctlExecutor.shutdownNow() }
         scope.cancel()
     }
 
@@ -395,7 +404,7 @@ class ScrcpyClient(
         serverEnded = false
         ready = false
 
-        adb.shell("pkill -f 'com.genymobile.scrcpy.Serve[r]' 2>/dev/null; echo ok", 8_000L)
+        adb.shell("pkill -f 'com.genymobile.scrcpy.Serve[r].* video=true' 2>/dev/null; echo ok", 8_000L)
         onProgress?.invoke("Iniciando servidor no dispositivo…")
         val shell = withContext(Dispatchers.IO) { adb.openStream("shell:$command") }
         serverStream = shell
@@ -638,7 +647,7 @@ class ScrcpyClient(
     }
 
     private fun enqueue(packet: ByteArray): Boolean {
-        if (!isReady()) return false
+        if (!isReady()) return enqueueControl(packet)
         val channel = controlChannel
         if (channel.isClosedForSend) return false
         return channel.trySend(packet).isSuccess
@@ -678,6 +687,14 @@ class ScrcpyClient(
     // ------------------------------------------------------------------
     // Server jar & shell helpers
     // ------------------------------------------------------------------
+
+    /** Serialize asset extraction and push so video/control starts cannot interleave. */
+    private suspend fun prepareAndPushJar(onProgress: ((String) -> Unit)?) = jarLock.withLock {
+        val jar = withTimeoutOrNull(30_000L) { prepareServerJar(onProgress) }
+            ?: throw IOException("tempo esgotado ao preparar o servidor scrcpy")
+        val pushed = withTimeoutOrNull(20_000L) { pushJarIfNeeded(jar, onProgress) }
+        if (pushed == null) throw IOException("tempo esgotado ao enviar o servidor scrcpy")
+    }
 
     private suspend fun prepareServerJar(onProgress: ((String) -> Unit)?) = withContext(Dispatchers.IO) {
         val local = File(appContext.filesDir, SERVER_JAR_NAME)
@@ -779,7 +796,7 @@ class ScrcpyClient(
             delay(budget(1_500L))
         }
         runPrivileged(
-            "pkill -f 'com.genymobile.scrcpy.Serve[r]' 2>/dev/null; echo ok",
+            "pkill -f 'com.genymobile.scrcpy.Serve[r].* video=true' 2>/dev/null; echo ok",
             budget(5_000L),
         )
         rootFixesHost = host
@@ -864,6 +881,7 @@ class ScrcpyClient(
                 "scid=$scid log_level=info tunnel_forward=true control=true video=true " +
                 "audio=false cleanup=false clipboard_autosync=false",
         )
+        if (displayOff) command.append(" power_on=false")
         command.append(" max_size=").append(tier.maxSize)
             .append(" max_fps=").append(tier.maxFps)
             .append(" video_bit_rate=").append(tier.bitrate)
@@ -874,6 +892,156 @@ class ScrcpyClient(
                 "send_device_meta=true send_dummy_byte=true",
         )
         return command.toString()
+    }
+
+    // ------------------------------------------------------------------
+    // Control-only session (video=false): keys never depend on the video pipeline
+    // ------------------------------------------------------------------
+
+    private val ctlStarting = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val ctlExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "scrcpy-ctl").apply { isDaemon = true }
+    }
+
+    @Volatile private var ctlGeneration = 0
+
+    @Volatile private var ctlReady = false
+
+    @Volatile private var ctlRetryAfterMs = 0L
+
+    @Volatile private var ctlShell: AdbStream? = null
+    @Volatile private var ctlStream: AdbStream? = null
+    private var ctlJob: Job? = null
+
+    fun isControlReady(): Boolean {
+        val stream = ctlStream ?: return false
+        return ctlReady && !stream.isClosed && ctlJob?.isActive == true
+    }
+
+    private fun canSend(): Boolean = isReady() || isControlReady()
+
+    private fun enqueueControl(packet: ByteArray): Boolean {
+        val stream = ctlStream ?: return false
+        if (!ctlReady || stream.isClosed) return false
+        return try {
+            ctlExecutor.execute {
+                val done = AtomicBoolean(false)
+                val watchdog = scope.launch(Dispatchers.IO) {
+                    delay(CONTROL_WRITE_TIMEOUT_MS)
+                    if (!done.get() && ctlStream === stream) {
+                        closeStream(stream)
+                        ctlReady = false
+                    }
+                }
+                try {
+                    stream.write(packet, 0, packet.size)
+                    stream.flush()
+                    done.set(true)
+                } catch (_: Throwable) {
+                    if (ctlStream === stream) ctlReady = false
+                } finally {
+                    done.set(true)
+                    watchdog.cancel()
+                }
+            }
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    suspend fun startControl(): Boolean {
+        if (isControlReady()) return true
+        if (SystemClock.elapsedRealtime() < ctlRetryAfterMs) return false
+        if (!ctlStarting.compareAndSet(false, true)) return false
+        val token = ++ctlGeneration
+        try {
+            teardownControl()
+            prepareAndPushJar(null)
+            val scid = "%08x".format((UUID.randomUUID().mostSignificantBits and 0x7fff_ffffL).toInt())
+            val command = StringBuilder(
+                "CLASSPATH=$REMOTE_JAR app_process / com.genymobile.scrcpy.Server $SERVER_VERSION " +
+                    "scid=$scid log_level=info tunnel_forward=true control=true video=false audio=false " +
+                    "cleanup=false clipboard_autosync=false send_device_meta=false send_dummy_byte=true",
+            )
+            if (displayOff) command.append(" power_on=false")
+            adb.shell("pkill -f 'com.genymobile.scrcpy.Serve[r].* video=false' 2>/dev/null; echo ok", 8_000L)
+            val shell = withContext(Dispatchers.IO) { adb.openStream("shell:$command") }
+            ctlShell = shell
+            ctlJob = scope.launch(Dispatchers.IO) {
+                val buffer = ByteArray(2048)
+                try {
+                    while (isActive && !shell.isClosed) {
+                        if (shell.read(buffer, 0, buffer.size) <= 0) break
+                    }
+                } catch (_: Throwable) {
+                    // output is not needed; only the end of the server matters
+                } finally {
+                    if (token == ctlGeneration) {
+                        ctlReady = false
+                        ctlRetryAfterMs = SystemClock.elapsedRealtime() + 10_000L
+                    }
+                }
+            }
+            val destination = "localabstract:scrcpy_$scid"
+            val deadline = System.currentTimeMillis() + STREAM_TIMEOUT_MS
+            var stream: AdbStream? = null
+            while (stream == null && System.currentTimeMillis() < deadline) {
+                if (token != ctlGeneration) {
+                    closeStream(stream)
+                    throw CancellationException("controle interrompido")
+                }
+                if (shell.isClosed) throw IOException("servidor de controle encerrado")
+                try {
+                    stream = adb.openStream(destination)
+                } catch (t: Throwable) {
+                    if (t is CancellationException) throw t
+                    delay(80L)
+                }
+            }
+            val control = stream ?: throw IOException("tempo esgotado ao abrir o controle")
+            val dummy = ByteArray(1)
+            val got = withStreamGuard(control, (deadline - System.currentTimeMillis()).coerceAtLeast(1L)) {
+                withContext(Dispatchers.IO) { control.read(dummy, 0, 1) }
+            }
+            if (got == null || got <= 0) {
+                closeStream(control)
+                throw IOException("tempo esgotado no handshake de controle")
+            }
+            if (token != ctlGeneration || !adb.online.value || ctlJob?.isActive != true) {
+                closeStream(control)
+                teardownControl()
+                return false
+            }
+            ctlStream = control
+            ctlReady = true
+            return true
+        } catch (t: Throwable) {
+            teardownControl()
+            if (t is CancellationException) throw t
+            if (token == ctlGeneration) {
+                ctlRetryAfterMs = SystemClock.elapsedRealtime() + 10_000L
+            }
+            return false
+        } finally {
+            ctlStarting.set(false)
+        }
+    }
+
+    fun stopControl() {
+        ctlGeneration++
+        ctlRetryAfterMs = 0L
+        teardownControl()
+    }
+
+    private fun teardownControl() {
+        ctlReady = false
+        ctlJob?.cancel()
+        ctlJob = null
+        closeStream(ctlStream)
+        ctlStream = null
+        closeStream(ctlShell)
+        ctlShell = null
     }
 
     // ------------------------------------------------------------------
@@ -940,6 +1108,7 @@ class ScrcpyClient(
         const val SESSION_START_TIMEOUT_MS = 45_000L
         const val ROOT_FIX_BUDGET_MS = 12_000L
         const val STREAM_TIMEOUT_MS = 12_000L
+        const val CONTROL_WRITE_TIMEOUT_MS = 3_000L
         const val FIRST_FRAME_TIMEOUT_MS = 12_000L
         const val VIDEO_READ_TIMEOUT_MS = 8_000L
         const val MAX_PACKET_SIZE = 8 * 1024 * 1024
