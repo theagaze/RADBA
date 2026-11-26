@@ -25,6 +25,9 @@ class VideoDecoder : Closeable {
     /** True after at least one buffer has been rendered to a surface. */
     val firstFrame = MutableStateFlow(false)
 
+    /** True after at least one frame has been decoded, even without a surface. */
+    val frameReceived = MutableStateFlow(false)
+
     /** Last configuration/decoding failure, empty when healthy. */
     val error = MutableStateFlow("")
 
@@ -320,6 +323,7 @@ class VideoDecoder : Closeable {
                     val configOnly = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
                     val isFrame = !configOnly &&
                         (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) == 0
+                    if (isFrame && !frameReceived.value) frameReceived.value = true
                     val render = !closed && surfaceRef != null && isFrame
                     try {
                         codec.releaseOutputBuffer(index, render)

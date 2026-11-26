@@ -87,6 +87,8 @@ class ScrcpyClient(
 
     @Volatile private var serverEnded = false
 
+    @Volatile private var rootFixesHost: String? = null
+
     @Volatile private var viewWidth = 0
 
     @Volatile private var viewHeight = 0
@@ -161,7 +163,11 @@ class ScrcpyClient(
                     "${tier.name} · tentativa ${index + 1}/${plan.size}: ${encoder ?: "hardware (padrão)"}",
                 )
                 try {
-                    launchSession(token, tier, encoder, onProgress)
+                    val launched = withTimeoutOrNull(20_000L) {
+                        launchSession(token, tier, encoder, onProgress)
+                        true
+                    }
+                    if (launched != true) throw IOException("tempo esgotado ao iniciar a sessão de vídeo")
                     if (token != generation) return false
                     activeEncoder.value = encoder ?: "hardware (padrão)"
                     error.value = ""
@@ -172,7 +178,7 @@ class ScrcpyClient(
                     lastReason = describe(t)
                     onProgress?.invoke(lastReason)
                     teardown()
-                    if (index < plan.lastIndex) delay(400L)
+                    if (index < plan.lastIndex) delay(150L)
                 }
             }
             if (token == generation) {
@@ -207,6 +213,11 @@ class ScrcpyClient(
     fun resetTier() {
         tierIndex = 0
         mirrorStats.value = MirrorStats(currentTier().maxFps, 0, 0, currentTier().name)
+    }
+
+    /** Called when ADB goes offline so root fixes are rechecked on the next connection. */
+    fun resetRootFixes() {
+        rootFixesHost = null
     }
 
     /**
@@ -402,12 +413,12 @@ class ScrcpyClient(
         videoDecoder.configure(surfaceRef, width, height)
         videoJob = scope.launch(Dispatchers.IO) { readVideo(token, streams.first, videoDecoder) }
 
-        val firstFrame = withTimeoutOrNull(FIRST_FRAME_TIMEOUT_MS) {
-            combine(videoDecoder.configured, videoDecoder.firstFrame) { configured, frame ->
+        val decoded = withTimeoutOrNull(FIRST_FRAME_TIMEOUT_MS) {
+            combine(videoDecoder.configured, videoDecoder.frameReceived) { configured, frame ->
                 configured && frame
             }.first { it }
         }
-        if (firstFrame != true) throw IOException("nenhum frame recebido")
+        if (decoded != true) throw IOException("nenhum frame decodificado")
     }
 
     private suspend fun openStreams(
@@ -427,7 +438,7 @@ class ScrcpyClient(
                     video = adb.openStream(destination)
                 } catch (t: Throwable) {
                     if (t is CancellationException) throw t
-                    delay(150L)
+                    delay(80L)
                 }
             }
             val videoStream = video ?: throw IOException("tempo esgotado ao abrir o stream de vídeo")
@@ -447,7 +458,7 @@ class ScrcpyClient(
                     control = adb.openStream(destination)
                 } catch (t: Throwable) {
                     if (t is CancellationException) throw t
-                    delay(150L)
+                    delay(80L)
                 }
             }
             val controlStream = control ?: throw IOException("tempo esgotado ao abrir o stream de controle")
@@ -667,19 +678,23 @@ class ScrcpyClient(
         }
 
     private suspend fun applyRootFixes(onProgress: ((String) -> Unit)?) {
+        val host = adb.host.value
+        if (rootFixesHost == host) return
         onProgress?.invoke("Aplicando ajustes de vídeo (root)…")
-        runPrivileged("service call SurfaceFlinger 1008 i32 1", 30_000L)
-        val property = runPrivileged("getprop vendor.media.c2.vdec.support", 20_000L)
+        val surfaceFix = runPrivileged("service call SurfaceFlinger 1008 i32 1", 20_000L)
+        if (!surfaceFix.ok) return
+        val property = runPrivileged("getprop vendor.media.c2.vdec.support", 12_000L)
         if (property.stdout.trim() != "false") {
             runPrivileged(
                 "setprop vendor.media.c2.vdec.support false && " +
                     "setprop ctl.restart android-hardware-media-c2-hal-1-2 && " +
                     "setprop ctl.restart media",
-                60_000L,
+                45_000L,
             )
-            delay(1_200L)
+            delay(500L)
         }
-        runPrivileged("pkill -f 'com.genymobile.scrcpy.Serve[r]' 2>/dev/null; echo ok", 20_000L)
+        runPrivileged("pkill -f 'com.genymobile.scrcpy.Serve[r]' 2>/dev/null; echo ok", 12_000L)
+        rootFixesHost = host
     }
 
     /**
@@ -785,6 +800,7 @@ class ScrcpyClient(
         serverStream = null
         decoder?.close()
         decoder = null
+        deviceSize.value = 0 to 0
         serverEnded = false
     }
 
@@ -820,8 +836,8 @@ class ScrcpyClient(
             "https://github.com/Genymobile/scrcpy/releases/download/v2.7/scrcpy-server-v2.7"
         const val MIN_JAR_SIZE = 10_000
         const val MAX_LOG_CHARS = 16_384
-        const val STREAM_TIMEOUT_MS = 25_000L
-        const val FIRST_FRAME_TIMEOUT_MS = 14_000L
+        const val STREAM_TIMEOUT_MS = 12_000L
+        const val FIRST_FRAME_TIMEOUT_MS = 8_000L
         const val MAX_PACKET_SIZE = 64 * 1024 * 1024
         const val MAX_TEXT_BYTES = 260
         const val ADAPT_COOLDOWN_MS = 8_000L

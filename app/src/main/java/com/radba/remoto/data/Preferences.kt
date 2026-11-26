@@ -20,8 +20,6 @@ private object Keys {
     val HOST = stringPreferencesKey("host")
     val DIM = intPreferencesKey("dim")
     val MIRROR = booleanPreferencesKey("mirror")
-    val AUDIO_PC = booleanPreferencesKey("audio_pc")
-    val KB = booleanPreferencesKey("kb")
     val BASE_BRIGHTNESS = intPreferencesKey("base_brightness")
     val BASE_CONTRAST = intPreferencesKey("base_contrast")
     val BASE_SATURATION = intPreferencesKey("base_saturation")
@@ -40,6 +38,8 @@ private object LegacyKeys {
     val FPS_MODE = stringPreferencesKey("fps_mode")
     val RES_MODE = stringPreferencesKey("res_mode")
     val HW_ACCEL = booleanPreferencesKey("hwaccel")
+    val AUDIO_PC = booleanPreferencesKey("audio_pc")
+    val KB = booleanPreferencesKey("kb")
 }
 
 class AppPreferences(context: Context) {
@@ -52,9 +52,13 @@ class AppPreferences(context: Context) {
 
     suspend fun currentFavorites(): Set<String> = favorites.first()
 
+    /** Removes obsolete keys once at startup, even if the user never changes a setting. */
+    suspend fun migrate() {
+        dataStore.edit { p -> dropLegacy(p) }
+    }
+
     suspend fun update(transform: (Prefs) -> Prefs) {
-        val next = transform(current()).validated()
-        dataStore.edit { p -> write(p, next) }
+        dataStore.edit { p -> write(p, transform(read(p)).validated()) }
     }
 
     suspend fun setFavorites(values: Set<String>) {
@@ -68,8 +72,6 @@ class AppPreferences(context: Context) {
         host = p[Keys.HOST] ?: Prefs().host,
         dim = p[Keys.DIM] ?: Prefs().dim,
         mirror = p[Keys.MIRROR] ?: Prefs().mirror,
-        audioPc = p[Keys.AUDIO_PC] ?: Prefs().audioPc,
-        kb = p[Keys.KB] ?: Prefs().kb,
         base = PictureBase(
             brightness = p[Keys.BASE_BRIGHTNESS] ?: 50,
             contrast = p[Keys.BASE_CONTRAST] ?: 50,
@@ -87,8 +89,6 @@ class AppPreferences(context: Context) {
         p[Keys.HOST] = prefs.host
         p[Keys.DIM] = prefs.dim
         p[Keys.MIRROR] = prefs.mirror
-        p[Keys.AUDIO_PC] = prefs.audioPc
-        p[Keys.KB] = prefs.kb
         p[Keys.BASE_BRIGHTNESS] = prefs.base.brightness
         p[Keys.BASE_CONTRAST] = prefs.base.contrast
         p[Keys.BASE_SATURATION] = prefs.base.saturation
@@ -106,9 +106,17 @@ class AppPreferences(context: Context) {
         p.remove(LegacyKeys.FPS_MODE)
         p.remove(LegacyKeys.RES_MODE)
         p.remove(LegacyKeys.HW_ACCEL)
+        p.remove(LegacyKeys.AUDIO_PC)
+        p.remove(LegacyKeys.KB)
     }
 
     private fun Prefs.validated(): Prefs = copy(
+        dim = dim.coerceIn(0, 100),
+        base = base.copy(
+            brightness = base.brightness.coerceIn(0, 100),
+            contrast = base.contrast.coerceIn(0, 100),
+            saturation = base.saturation.coerceIn(0, 100),
+        ),
         vBright = vBright.coerceIn(10, 100),
         vWarm = vWarm.coerceIn(0, 100),
         nightBright = nightBright.coerceIn(10, 99),

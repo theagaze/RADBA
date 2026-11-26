@@ -2,6 +2,7 @@ package com.radba.remoto.adb
 
 import com.radba.remoto.data.FileEntry
 import io.github.muntashirakon.adb.AdbStream
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -78,6 +79,9 @@ internal object AdbSync {
                     ?: throw IOException("sem resposta do ADB ao ler $path")
                 when (header.id) {
                     "DATA" -> {
+                        if (header.value < 0 || header.value > MAX_SYNC_PAYLOAD) {
+                            throw IOException("tamanho inválido ao ler $path")
+                        }
                         val payload = readExact(stream, header.value)
                             ?: throw IOException("dados truncados ao ler $path")
                         output.write(payload)
@@ -152,8 +156,10 @@ internal suspend fun readStreamToBytes(
             if (count <= 0) break
             output.write(buffer, 0, count)
         }
-    } catch (error: IOException) {
-        // The daemon closes the stream at EOF.
+    } catch (error: CancellationException) {
+        throw error
+    } catch (error: Exception) {
+        // The daemon closes the stream at EOF or the watchdog cancels a slow read.
     } finally {
         watchdog.cancel()
         closeQuietly(stream)
@@ -208,6 +214,7 @@ private fun readFailure(stream: AdbStream, length: Int, fallback: String): Strin
 }
 
 private fun readExact(stream: AdbStream, size: Int): ByteArray? {
+    if (size < 0 || size > MAX_RESPONSE_PAYLOAD) return null
     val result = ByteArray(size)
     var offset = 0
     while (offset < size) {

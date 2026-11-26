@@ -82,16 +82,17 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
 
     val stageMessage = when {
         state.connection == ConnectionState.DISCONNECTED -> "Projetor desconectado"
-        mirrorOn -> null
         state.prefs.mirror && state.mirrorError.isNotBlank() ->
             "Transmissão melhorada (scrcpy) reconectando…\n${trunc(state.mirrorError, 90)}"
+        mirrorOn -> null
         state.prefs.mirror -> "Iniciando transmissão melhorada (scrcpy)…"
         state.screenshot != null -> null
-        else -> "Aguardando conexão…"
+        else -> state.screenshotStatus.ifBlank { "Aguardando conexão…" }
     }
 
     val status = when {
         state.connection == ConnectionState.DISCONNECTED -> "Desconectado"
+        state.prefs.mirror && state.mirrorError.isNotBlank() -> "Reconectando scrcpy…"
         mirrorOn -> buildString {
             append("scrcpy · ")
             if (state.mirrorFps >= 1) {
@@ -101,9 +102,31 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
             }
             if (state.mirrorLatencyMs > 0) append(" · ").append(state.mirrorLatencyMs).append("ms")
         }
-        state.prefs.mirror && state.mirrorError.isNotBlank() -> "Reconectando scrcpy…"
         state.prefs.mirror -> "Iniciando scrcpy…"
         else -> state.screenshotStatus.ifBlank { "Aguardando…" }
+    }
+
+    val screenshotBitmap = remember(state.screenshot) { state.screenshot?.asImageBitmap() }
+
+    val touchModifier = Modifier.pointerInput(Unit) {
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false)
+            down.consume()
+            runCatching { viewModel.screenTouch(0, down.position.x, down.position.y) }
+            var last = down.position
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Main)
+                val change = event.changes.firstOrNull { it.id == down.id }
+                if (change != null && !change.pressed) {
+                    runCatching { viewModel.screenTouch(1, change.position.x, change.position.y) }
+                    break
+                }
+                if (change != null && change.position != last) {
+                    runCatching { viewModel.screenTouch(2, change.position.x, change.position.y) }
+                    last = change.position
+                }
+            }
+        }
     }
 
     Column(modifier = Modifier.fillMaxSize().background(GlassColors.bg)) {
@@ -111,34 +134,13 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
-                .background(Color.Black),
+                .background(Color.Black)
+                .then(touchModifier),
         ) {
-            val touchModifier = if (showShot) Modifier else Modifier.pointerInput(Unit) {
-                awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false)
-                    down.consume()
-                    runCatching { viewModel.screenTouch(0, down.position.x, down.position.y) }
-                    var last = down.position
-                    while (true) {
-                        val event = awaitPointerEvent(PointerEventPass.Initial)
-                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                        if (!change.pressed) {
-                            runCatching { viewModel.screenTouch(1, change.position.x, change.position.y) }
-                            break
-                        }
-                        if (change.position != last) {
-                            runCatching { viewModel.screenTouch(2, change.position.x, change.position.y) }
-                            last = change.position
-                        }
-                    }
-                }
-            }
-
             AndroidView(
                 modifier = Modifier
                     .fillMaxSize()
-                    .alpha(if (showShot) 0f else 1f)
-                    .then(touchModifier),
+                    .alpha(if (showShot) 0f else 1f),
                 factory = { context ->
                     var mirrorSurface: Surface? = null
                     TextureView(context).apply {
@@ -150,11 +152,13 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                                 height: Int,
                             ) {
                                 runCatching {
-                                    mirrorSurface?.release()
-                                    mirrorSurface = Surface(surfaceTexture)
-                                    viewModel.attachMirrorSurface(mirrorSurface)
+                                    val previous = mirrorSurface
+                                    val next = Surface(surfaceTexture)
+                                    mirrorSurface = next
+                                    viewModel.attachMirrorSurface(next)
                                     viewModel.updateMirrorView(width, height)
                                     viewModel.ensureMirror()
+                                    previous?.release()
                                 }
                             }
 
@@ -182,9 +186,9 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 },
             )
 
-            if (showShot && state.screenshot != null) {
+            if (showShot && screenshotBitmap != null) {
                 Image(
-                    bitmap = state.screenshot.asImageBitmap(),
+                    bitmap = screenshotBitmap,
                     contentDescription = "Captura do projetor",
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxSize(),
@@ -367,16 +371,12 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                         }
                         GlassButton(
                             label = "⌨ Texto",
-                            onClick = { liveTextOpen = !liveTextOpen },
+                            onClick = {
+                                liveTextOpen = !liveTextOpen
+                                if (liveTextOpen) controlsExpanded = true
+                            },
                             modifier = Modifier.width(76.dp),
                             selected = liveTextOpen,
-                            compact = true,
-                        )
-                        GlassButton(
-                            label = if (state.prefs.audioPc) "🔊 Som PC" else "🔇 Som PC",
-                            onClick = { viewModel.toggleAudioPc() },
-                            modifier = Modifier.width(88.dp),
-                            selected = state.prefs.audioPc,
                             compact = true,
                         )
                     }

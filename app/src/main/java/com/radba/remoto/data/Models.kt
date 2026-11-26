@@ -42,8 +42,6 @@ data class Prefs(
     val host: String = "192.168.100.12:5555",
     val dim: Int = 0,
     val mirror: Boolean = true,
-    val audioPc: Boolean = false,
-    val kb: Boolean = true,
     val base: PictureBase = PictureBase(),
     val rootFixVideo: Boolean = true,
     val vBright: Int = 100,
@@ -77,6 +75,8 @@ data class FileEntry(
 )
 
 data class VolumeInfo(val level: Int, val max: Int)
+
+data class ScreenshotResult(val bytes: ByteArray? = null, val reason: String = "")
 
 data class StorageStats(
     val total: Long = 0,

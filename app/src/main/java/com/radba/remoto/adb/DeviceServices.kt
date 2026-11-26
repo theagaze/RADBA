@@ -6,6 +6,7 @@ import com.radba.remoto.data.DeviceInfo
 import com.radba.remoto.data.FileEntry
 import com.radba.remoto.data.PerfStats
 import com.radba.remoto.data.ProcessInfo
+import com.radba.remoto.data.ScreenshotResult
 import com.radba.remoto.data.StorageStats
 import com.radba.remoto.data.VolumeInfo
 import com.radba.remoto.util.appTitle
@@ -15,16 +16,20 @@ import com.radba.remoto.util.shellQuote
 import com.radba.remoto.util.shellStripExitCode
 import com.radba.remoto.util.trunc
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.zip.GZIPInputStream
 import kotlin.math.max
 
 /** Device-level operations built on top of ADB shell commands. */
 class DeviceServices(private val adb: AdbManager) {
+    private val cpuMutex = Mutex()
     private var previousCpu: Pair<Long, Long>? = null
 
     suspend fun getVolume(): VolumeInfo? {
@@ -227,8 +232,11 @@ class DeviceServices(private val adb: AdbManager) {
             if (numbers.size >= 4) {
                 val idle = numbers[3] + numbers.getOrElse(4) { 0L }
                 val total = numbers.sum()
-                val previous = previousCpu
-                previousCpu = total to idle
+                val previous = cpuMutex.withLock {
+                    val current = previousCpu
+                    previousCpu = total to idle
+                    current
+                }
                 if (previous != null && total > previous.first) {
                     val deltaTotal = total - previous.first
                     val deltaIdle = idle - previous.second
@@ -338,22 +346,26 @@ class DeviceServices(private val adb: AdbManager) {
         }
     }
 
-    suspend fun screenshot(): ByteArray? {
+    suspend fun screenshot(): ScreenshotResult {
         val direct = readStreamToBytes(adb, "exec-out:screencap -p", 25_000)
-        if (direct.isPng()) return direct
+        if (direct.isPng()) return ScreenshotResult(direct)
+        direct.screenshotFailureReason()?.let { return ScreenshotResult(null, it) }
 
-        val shellRaw = readStreamToBytes(adb, "shell:screencap -p", 25_000) ?: return null
+        val shellRaw = readStreamToBytes(adb, "shell:screencap -p", 25_000)
+            ?: return ScreenshotResult(null, direct.screenshotFailureReason() ?: "screencap não respondeu")
         val withoutExit = shellStripExitCode(normalizeCrLf(shellRaw)).data
-        if (withoutExit.isPng()) return withoutExit
+        if (withoutExit.isPng()) return ScreenshotResult(withoutExit)
 
         if (withoutExit.size > 4) {
             val header = ByteBuffer.wrap(withoutExit, 0, 4).order(ByteOrder.BIG_ENDIAN).int
             val little = ByteBuffer.wrap(withoutExit, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
             val body = withoutExit.copyOfRange(4, withoutExit.size)
-            if (header > 0 && header == body.size && body.isPng()) return body
-            if (little > 0 && little == body.size && body.isPng()) return body
+            if (header > 0 && header == body.size && body.isPng()) return ScreenshotResult(body)
+            if (little > 0 && little == body.size && body.isPng()) return ScreenshotResult(body)
         }
-        return null
+        val reason = withoutExit.screenshotFailureReason(includeGeneric = true)
+            ?: if (withoutExit.isEmpty()) "screencap retornou vazio" else "screencap retornou dados inválidos"
+        return ScreenshotResult(null, reason)
     }
 
     private fun resultOf(result: ShellResult): Result<Unit> {
@@ -385,7 +397,15 @@ private fun splitOnce(text: String, marker: String): Pair<String, String> {
     return if (index < 0) text to "" else text.substring(0, index) to text.substring(index + marker.length)
 }
 
-private fun parseDfKb(line: String): StorageStats? {
+private fun parseDfKb(raw: String): StorageStats? {
+    var result: StorageStats? = null
+    for (line in raw.lineSequence()) {
+        result = parseDfKbLine(line) ?: continue
+    }
+    return result
+}
+
+private fun parseDfKbLine(line: String): StorageStats? {
     val parts = line.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
     if (parts.size < 5) return null
     val total = parts[1].toLongOrNull() ?: return null
@@ -405,6 +425,28 @@ private fun ByteArray?.isPng(): Boolean {
         if (this[index] != PNG_MAGIC[index]) return false
     }
     return true
+}
+
+private fun ByteArray?.screenshotFailureReason(includeGeneric: Boolean = false): String? {
+    if (this == null || isEmpty()) return null
+    val sample = take(240).toByteArray()
+    if (sample.any { it == 0.toByte() }) return null
+    val text = String(sample, StandardCharsets.UTF_8).trim()
+    if (text.isEmpty()) return null
+    val low = text.lowercase(Locale.ROOT)
+    val known = when {
+        low.contains("permission") || low.contains("denied") ->
+            "permissão negada pelo dispositivo"
+        low.contains("secure") || low.contains("blocked") ->
+            "conteúdo protegido pelo dispositivo"
+        else -> null
+    }
+    if (known != null) return known
+    return if (includeGeneric) {
+        "screencap retornou dados inválidos: ${trunc(text, 80)}"
+    } else {
+        null
+    }
 }
 
 private fun normalizeCrLf(bytes: ByteArray): ByteArray {

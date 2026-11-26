@@ -152,8 +152,8 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             )
             Text(
-                text = "Quando ativada e os complementos estiverem instalados, permanece 100% no scrcpy " +
-                    "(30–60 FPS automático conforme a rede). Ao desativar, usa captura periódica.",
+                text = "Servidor scrcpy v2.7 integrado no app, sem download e sem adb forward. " +
+                    "Perfil automático de 30 a 60 FPS conforme a rede. Ao desativar, usa captura periódica.",
                 color = GlassColors.sub,
                 fontSize = 11.sp,
                 modifier = Modifier.padding(top = 6.dp),
@@ -175,21 +175,10 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 GlassButton(
-                    "Baixar transmissão melhorada (opcional)",
-                    onClick = { viewModel.installLive() },
-                    modifier = Modifier.weight(1f),
+                    "Reiniciar vídeo",
+                    onClick = { viewModel.startMirror() },
+                    modifier = Modifier.fillMaxWidth(),
                     selected = true,
-                    compact = true,
-                )
-                GlassButton(
-                    "Reiniciar scrcpy",
-                    onClick = {
-                        runCatching {
-                            viewModel.stopMirror()
-                            viewModel.startMirror()
-                        }
-                    },
-                    modifier = Modifier.weight(1f),
                     compact = true,
                 )
             }
@@ -298,16 +287,6 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 color = GlassColors.sub,
                 fontSize = 11.sp,
                 modifier = Modifier.padding(top = 6.dp),
-            )
-        }
-
-        GlassCard {
-            Text(text = "Entrada e Teclado", color = GlassColors.text, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-            GlassToggle(
-                checked = prefs.kb,
-                onCheckedChange = { viewModel.setKeyboardEnabled(it) },
-                label = "Teclado do PC controla o projetor na tela Início",
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             )
         }
 

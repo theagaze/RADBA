@@ -1,33 +1,34 @@
 package com.radba.remoto.ui
 
-import android.view.KeyEvent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.input.key.KeyEvent as ComposeKeyEvent
-import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.radba.remoto.MainViewModel
 import com.radba.remoto.data.ConnectionState
 import com.radba.remoto.data.Tab
-import com.radba.remoto.ui.components.GlassButton
 import com.radba.remoto.ui.components.GlassCard
 import com.radba.remoto.ui.components.ToastHost
 import com.radba.remoto.ui.screens.AppsScreen
@@ -40,88 +41,85 @@ import com.radba.remoto.ui.theme.GlassColors
 
 @Composable
 fun MainScreen(viewModel: MainViewModel) {
-    val state by viewModel.uiState.collectAsState(initial = MainViewModel.UiState())
+    val state by viewModel.uiState.collectAsState()
+    val orientation = LocalConfiguration.current.orientation
 
-    Scaffold(
-        containerColor = GlassColors.bg,
-        bottomBar = { BottomNavigation(state.tab, viewModel) },
-    ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(GlassColors.bg)
-                .padding(padding)
-                .onKeyEvent { event -> forwardGlobalKey(event, state, viewModel) },
-        ) {
-            Header(state.tab, state.connection, viewModel)
-            Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
-                when (state.tab) {
-                    Tab.HOME -> HomeScreen(viewModel, state)
-                    Tab.APPS -> AppsScreen(viewModel, state)
-                    Tab.FILES -> FilesScreen(viewModel, state)
-                    Tab.PERF -> PerfScreen(viewModel, state)
-                    Tab.SETTINGS -> SettingsScreen(viewModel, state)
-                    Tab.TERMINAL -> TerminalScreen(viewModel, state)
+    LaunchedEffect(orientation) { viewModel.onOrientationChanged(orientation) }
+
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val compact = maxHeight < 520.dp
+        Scaffold(
+            containerColor = GlassColors.bg,
+            snackbarHost = { ToastHost(viewModel.toasts) },
+            bottomBar = { BottomNavigation(state.tab, viewModel, compact) },
+        ) { padding ->
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(GlassColors.bg)
+                    .padding(padding),
+            ) {
+                Header(state.tab, state.connection, compact)
+                Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                    when (state.tab) {
+                        Tab.HOME -> HomeScreen(viewModel, state)
+                        Tab.APPS -> AppsScreen(viewModel, state)
+                        Tab.FILES -> FilesScreen(viewModel, state)
+                        Tab.PERF -> PerfScreen(viewModel, state)
+                        Tab.SETTINGS -> SettingsScreen(viewModel, state)
+                        Tab.TERMINAL -> TerminalScreen(viewModel, state)
+                    }
                 }
-                ToastHost(
-                    toasts = viewModel.toasts,
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 8.dp),
-                )
             }
         }
     }
 }
 
 @Composable
-private fun Header(tab: Tab, connection: ConnectionState, viewModel: MainViewModel) {
-    val status = when (connection) {
-        ConnectionState.CONNECTED -> "● Conectado"
-        ConnectionState.DISCONNECTED -> "● Desconectado"
-        ConnectionState.CONNECTING -> "● Conectando…"
+private fun Header(tab: Tab, connection: ConnectionState, compact: Boolean) {
+    val (label, color) = when (connection) {
+        ConnectionState.CONNECTED -> "● Conectado" to GlassColors.ok
+        ConnectionState.DISCONNECTED -> "● Desconectado" to GlassColors.bad
+        ConnectionState.CONNECTING -> "● Conectando…" to GlassColors.acc
     }
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 14.dp, vertical = 10.dp),
+            .padding(horizontal = 12.dp, vertical = if (compact) 2.dp else 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = "RADBA REMOTO",
-                color = GlassColors.sub,
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Medium,
-                letterSpacing = 2.sp,
-            )
-            Text(
-                text = tab.label,
-                color = GlassColors.text,
-                fontSize = 22.sp,
-                fontWeight = FontWeight.Bold,
-            )
-        }
-        GlassButton(
-            label = status,
-            onClick = { viewModel.reconnect() },
-            selected = connection == ConnectionState.CONNECTED,
-            danger = connection == ConnectionState.DISCONNECTED,
-            compact = true,
+        Text(
+            text = "RADBA · ${tab.label}",
+            color = GlassColors.sub,
+            fontSize = if (compact) 10.sp else 11.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = label,
+            color = color,
+            fontSize = if (compact) 9.sp else 10.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            modifier = Modifier
+                .background(color.copy(alpha = 0.14f), RoundedCornerShape(999.dp))
+                .padding(horizontal = 8.dp, vertical = 2.dp),
         )
     }
 }
 
 @Composable
-private fun BottomNavigation(current: Tab, viewModel: MainViewModel) {
+private fun BottomNavigation(current: Tab, viewModel: MainViewModel, compact: Boolean) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 14.dp, vertical = 10.dp),
+            .navigationBarsPadding()
+            .padding(horizontal = 10.dp, vertical = if (compact) 2.dp else 6.dp),
     ) {
         GlassCard(
-            corner = 22.dp,
-            contentPadding = PaddingValues(horizontal = 2.dp, vertical = 4.dp),
+            corner = if (compact) 16.dp else 22.dp,
+            contentPadding = PaddingValues(horizontal = 2.dp, vertical = 2.dp),
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -134,64 +132,28 @@ private fun BottomNavigation(current: Tab, viewModel: MainViewModel) {
                     Column(
                         modifier = Modifier
                             .weight(1f)
-                            .heightIn(min = 52.dp)
+                            .heightIn(min = if (compact) 44.dp else 48.dp)
                             .clickable { runCatching { viewModel.selectTab(tab) } }
-                            .padding(vertical = 3.dp),
+                            .padding(vertical = 2.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(1.dp),
                     ) {
                         Text(
                             text = tab.glyph,
                             color = tint,
-                            fontSize = 17.sp,
+                            fontSize = if (compact) 15.sp else 17.sp,
                             fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
                         )
-                        Text(
-                            text = navLabel(tab),
-                            color = tint,
-                            fontSize = 9.sp,
-                            maxLines = 1,
-                        )
+                        if (!compact) {
+                            Text(
+                                text = navLabel(tab),
+                                color = tint,
+                                fontSize = 9.sp,
+                                maxLines = 1,
+                            )
+                        }
                     }
                 }
-            }
-        }
-    }
-}
-
-private fun forwardGlobalKey(
-    event: ComposeKeyEvent,
-    state: MainViewModel.UiState,
-    viewModel: MainViewModel,
-): Boolean {
-    if (!state.prefs.kb || state.connection != ConnectionState.CONNECTED) return false
-    val native = event.nativeKeyEvent
-    if (native.isCtrlPressed || native.isAltPressed || native.isMetaPressed) return false
-    if (native.action != KeyEvent.ACTION_DOWN || native.repeatCount > 0) return false
-    return when (native.keyCode) {
-        KeyEvent.KEYCODE_DPAD_UP,
-        KeyEvent.KEYCODE_DPAD_DOWN,
-        KeyEvent.KEYCODE_DPAD_LEFT,
-        KeyEvent.KEYCODE_DPAD_RIGHT,
-        KeyEvent.KEYCODE_ENTER,
-        KeyEvent.KEYCODE_DEL,
-        KeyEvent.KEYCODE_FORWARD_DEL,
-        KeyEvent.KEYCODE_TAB,
-        KeyEvent.KEYCODE_HOME,
-        KeyEvent.KEYCODE_MENU,
-        KeyEvent.KEYCODE_CALL,
-        KeyEvent.KEYCODE_ENDCALL,
-        KeyEvent.KEYCODE_POWER -> {
-            viewModel.sendKey(native.keyCode)
-            true
-        }
-        else -> {
-            val unicode = native.unicodeChar
-            if (unicode > 0 && Character.isLetterOrDigit(unicode)) {
-                viewModel.sendText(unicode.toChar().toString())
-                true
-            } else {
-                false
             }
         }
     }

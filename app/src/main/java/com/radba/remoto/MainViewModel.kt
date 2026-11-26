@@ -26,6 +26,7 @@ import com.radba.remoto.data.PictureBase
 import com.radba.remoto.data.Prefs
 import com.radba.remoto.data.ProcessInfo
 import com.radba.remoto.data.RootStatus
+import com.radba.remoto.data.ScreenshotResult
 import com.radba.remoto.data.SettingsNote
 import com.radba.remoto.data.Tab
 import com.radba.remoto.data.TerminalKind
@@ -66,6 +67,10 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
+private val DISPLAY_SIZE_REGEX = Regex("""(\d+)\s*[xX]\s*(\d+)""")
+
+private const val TOUCH_HOVER = 7
+
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     data class UiState(
         val tab: Tab = Tab.HOME,
@@ -95,7 +100,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val brightnessPct: Int = 100,
         val warmPct: Int = 0,
         val mirrorBusy: Boolean = false,
-        val installing: Boolean = false,
         val screenshot: Bitmap? = null,
         val screenshotStatus: String = "Aguardando…",
         val perf: PerfStats? = null,
@@ -133,7 +137,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         get() = _ui.value.terminalLines.joinToString("\n") { it.text }
 
     private val reconnecting = AtomicBoolean(false)
-    private val installingGuard = AtomicBoolean(false)
     private val screenshotBusy = AtomicBoolean(false)
     private val perfBusy = AtomicBoolean(false)
     private val deviceBusy = AtomicBoolean(false)
@@ -148,6 +151,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var lastVdimErrorMs = 0L
     private var mirrorRetryAfterMs = 0L
     private var lastOnline: Boolean? = false
+    private var lastOrientation = -1
+    private var pendingOrientationRestart = false
+
+    @Volatile
+    private var viewWidth = 0
+
+    @Volatile
+    private var viewHeight = 0
+
+    @Volatile
+    private var touchStart: Pair<Int, Int>? = null
+
+    @Volatile
+    private var touchLast: Pair<Int, Int>? = null
+
+    @Volatile
+    private var touchStartMs = 0L
 
     init {
         adb.setHost(prefsFlow.value.host)
@@ -194,6 +214,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
+
+        viewModelScope.launch { runCatching { prefsStore.migrate() } }
 
         reconnecting.set(true)
         safeLaunch {
@@ -316,9 +338,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             safeLaunch {
+                val rootJob = safeLaunchJob { refreshRootFeatures() }
                 refreshVolumeInternal()
                 refreshSettingsInternal()
-                refreshRootFeatures()
                 when (_ui.value.tab) {
                     Tab.APPS -> appsShown()
                     Tab.FILES -> reloadFiles()
@@ -326,11 +348,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     else -> Unit
                 }
                 ensureMirrorInternal()
+                rootJob.join()
                 if (!_ui.value.prefs.mirror) refreshScreenshot()
             }
         } else {
             scrcpy.stop()
             scrcpy.resetTier()
+            scrcpy.resetRootFixes()
             coalescedJobs.keys.toList().forEach { coalescedJobs[it]?.cancel() }
             coalescedJobs.clear()
             mirrorRetryAfterMs = 0L
@@ -371,6 +395,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ---------------------------------------------------------- conexao --
+
+    /** Restart only after a real rotation so the video size and touch map match the new layout. */
+    fun onOrientationChanged(orientation: Int) {
+        if (lastOrientation == orientation) return
+        val first = lastOrientation < 0
+        lastOrientation = orientation
+        if (first || !adb.online.value || !_ui.value.prefs.mirror) return
+        if (_ui.value.mirrorBusy || _ui.value.mirrorState != MirrorState.ON) {
+            pendingOrientationRestart = true
+            return
+        }
+        safeLaunch { restartMirrorInternal(announce = false) }
+    }
 
     fun selectTab(tab: Tab) {
         _ui.update { it.copy(tab = tab) }
@@ -507,12 +544,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateMirrorView(width: Int, height: Int) {
-        scrcpy.setViewSize(width, height)
+        viewWidth = width.coerceAtLeast(0)
+        viewHeight = height.coerceAtLeast(0)
+        scrcpy.setViewSize(viewWidth, viewHeight)
     }
 
     /** Surface callbacks restore the stream; they never force a restart. */
     fun ensureMirror() {
         safeLaunch { ensureMirrorInternal() }
+    }
+
+    private fun consumePendingOrientationRestart() {
+        if (!pendingOrientationRestart) return
+        pendingOrientationRestart = false
+        if (adb.online.value && _ui.value.prefs.mirror) {
+            safeLaunch { restartMirrorInternal(announce = false) }
+        }
     }
 
     private suspend fun ensureMirrorInternal() {
@@ -531,6 +578,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             toast("Espelho: ${trunc(t.message ?: "falha", 70)}", ToastKind.ERROR)
         } finally {
             _ui.update { it.copy(mirrorBusy = false) }
+            consumePendingOrientationRestart()
         }
     }
 
@@ -562,6 +610,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } finally {
             _ui.update { it.copy(mirrorBusy = false) }
             refreshScreenshot()
+            consumePendingOrientationRestart()
         }
     }
 
@@ -572,6 +621,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (_ui.value.mirrorBusy) {
             note("O espelho já está iniciando…", ToastKind.INFO)
+            return
+        }
+        if (!_ui.value.prefs.mirror) {
+            safeLaunch {
+                prefsStore.update { it.copy(mirror = true) }
+                _ui.update { it.copy(prefs = it.prefs.copy(mirror = true)) }
+                mirrorRetryAfterMs = 0L
+                restartMirrorInternal(announce = true)
+            }
             return
         }
         safeLaunch { restartMirrorInternal(announce = true) }
@@ -586,13 +644,59 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun screenTouch(action: Int, x: Float, y: Float) {
-        if (action == 7 && !scrcpy.isReady()) return
-        val device = scrcpy.screenToDevice(x, y)
-        if (scrcpy.sendTouch(action, device.first, device.second)) return
-        safeLaunch {
-            val result = adb.shell("input tap ${device.first} ${device.second}")
-            if (!result.ok) toast("Falha ao enviar toque: ${shellDetail(result, 70)}", ToastKind.ERROR)
+        if (action == TOUCH_HOVER && !scrcpy.isReady()) return
+        val mirrorReady = scrcpy.isReady()
+        val device = if (mirrorReady) scrcpy.screenToDevice(x, y) else mapFallbackTouch(x, y)
+        if (mirrorReady) {
+            scrcpy.sendTouch(action, device.first, device.second)
+            return
         }
+        when (action) {
+            0 -> {
+                touchStart = device
+                touchLast = device
+                touchStartMs = SystemClock.elapsedRealtime()
+            }
+            2 -> touchLast = device
+            1 -> {
+                val start = touchStart ?: device
+                val end = touchLast ?: device
+                val duration = (SystemClock.elapsedRealtime() - touchStartMs)
+                    .coerceIn(50L, 3_000L).toInt()
+                touchStart = null
+                touchLast = null
+                touchStartMs = 0L
+                safeLaunch {
+                    val command = "input swipe ${start.first} ${start.second} " +
+                        "${end.first} ${end.second} $duration"
+                    val result = adb.shell(command)
+                    if (!result.ok) toast("Falha ao enviar toque: ${shellDetail(result, 70)}", ToastKind.ERROR)
+                }
+            }
+        }
+    }
+
+    private fun mapFallbackTouch(x: Float, y: Float): Pair<Int, Int> {
+        val state = _ui.value
+        val size = state.screenshot?.let { it.width to it.height }
+            ?: parseDisplaySize(state.deviceInfo.wmSize)
+            ?: return 0 to 0
+        val (deviceW, deviceH) = size
+        if (viewWidth <= 0 || viewHeight <= 0) return 0 to 0
+        val scale = minOf(viewWidth.toFloat() / deviceW, viewHeight.toFloat() / deviceH)
+        if (scale <= 0f || scale.isNaN() || scale.isInfinite()) return 0 to 0
+        val left = (viewWidth - deviceW * scale) / 2f
+        val top = (viewHeight - deviceH * scale) / 2f
+        val px = ((x - left) / scale).toInt().coerceIn(0, deviceW - 1)
+        val py = ((y - top) / scale).toInt().coerceIn(0, deviceH - 1)
+        return px to py
+    }
+
+    private fun parseDisplaySize(raw: String): Pair<Int, Int>? {
+        val match = DISPLAY_SIZE_REGEX.find(raw) ?: return null
+        val width = match.groupValues[1].toIntOrNull() ?: return null
+        val height = match.groupValues[2].toIntOrNull() ?: return null
+        return if (width > 0 && height > 0) width to height else null
     }
 
     fun sendKey(code: Int) {
@@ -616,18 +720,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun toggleAudioPc() {
-        val enabled = !prefsFlow.value.audioPc
-        safeLaunch {
-            prefsStore.update { it.copy(audioPc = enabled) }
-            _ui.update { it.copy(prefs = it.prefs.copy(audioPc = enabled)) }
-        }
-        noteAndToast(
-            "Som no PC é exclusivo do desktop; preferência salva como ${if (enabled) "ativada" else "desativada"}.",
-            ToastKind.INFO,
-        )
-    }
-
     // ------------------------------------------------------- screenshot --
 
     fun refreshScreenshot() {
@@ -635,17 +727,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         safeLaunch {
             try {
                 val captureEnabled = adb.online.value && !_ui.value.prefs.mirror
-                val bytes = if (captureEnabled) runCatching { services.screenshot() }.getOrNull() else null
+                val capture = if (captureEnabled) {
+                    runCatching { services.screenshot() }.getOrNull()
+                        ?: ScreenshotResult(null, "captura indisponível")
+                } else {
+                    ScreenshotResult()
+                }
+                val bytes = capture.bytes
                 val bitmap = if (bytes != null && bytes.isNotEmpty()) {
                     runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }.getOrNull()
                 } else {
                     null
                 }
                 if (bitmap == null) {
+                    val detail = capture.reason.ifBlank { "screencap indisponível neste dispositivo" }
                     val status = when {
                         !adb.online.value -> "Desconectado"
                         _ui.value.prefs.mirror -> "Aguardando espelho…"
-                        else -> "Sem captura (tela bloqueada ou sem permissão)"
+                        else -> "Captura indisponível: $detail (o toque continua ativo)"
                     }
                     _ui.update { it.copy(screenshot = null, screenshotStatus = status) }
                 } else {
@@ -785,6 +884,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         _ui.update { it.copy(rootStatus = status) }
         if (status.available != true) return
+        scrcpy.resetRootFixes()
         val current = prefsFlow.value
         if (current.rootFixVideo) {
             runCatching { applyVideoFixInternal(disable = true) }
@@ -796,6 +896,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setRootFix(enabled: Boolean) {
         val previous = prefsFlow.value.rootFixVideo
+        scrcpy.resetRootFixes()
         safeLaunch {
             prefsStore.update { it.copy(rootFixVideo = enabled) }
             _ui.update { it.copy(prefs = it.prefs.copy(rootFixVideo = enabled)) }
@@ -820,58 +921,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // --------------------------------------------------------- preferencias --
 
     fun setMirrorEnabled(enabled: Boolean) {
-        safeLaunch {
-            prefsStore.update { it.copy(mirror = enabled) }
-            _ui.update { it.copy(prefs = it.prefs.copy(mirror = enabled)) }
-        }
+        _ui.update { it.copy(prefs = it.prefs.copy(mirror = enabled)) }
+        safeLaunch { prefsStore.update { it.copy(mirror = enabled) } }
         if (!enabled) {
             stopMirror()
             scrcpy.resetTier()
         } else {
             mirrorRetryAfterMs = 0L
             safeLaunch { ensureMirrorInternal() }
-        }
-    }
-
-    fun setKeyboardEnabled(enabled: Boolean) {
-        safeLaunch {
-            prefsStore.update { it.copy(kb = enabled) }
-            _ui.update { it.copy(prefs = it.prefs.copy(kb = enabled)) }
-        }
-    }
-
-    fun installLive() {
-        if (!installingGuard.compareAndSet(false, true)) {
-            note("Já está preparando…", ToastKind.INFO)
-            return
-        }
-        _ui.update { it.copy(installing = true) }
-        note("Preparando servidor integrado…", ToastKind.INFO)
-        safeLaunch {
-            val ok = runCatching {
-                val name = "scrcpy-server.jar"
-                val names = ctx.assets.list("") ?: emptyArray()
-                if (names.contains(name)) {
-                    val target = File(ctx.filesDir, name)
-                    ctx.assets.open(name).use { input ->
-                        target.outputStream().use { output -> input.copyTo(output) }
-                    }
-                    true
-                } else {
-                    File(ctx.filesDir, name).exists()
-                }
-            }.getOrDefault(false)
-            _ui.update { it.copy(installing = false) }
-            installingGuard.set(false)
-            if (ok) {
-                note("Pronto: servidor scrcpy disponível.", ToastKind.OK)
-                toast("Transmissão ao vivo pronta.", ToastKind.OK)
-                mirrorRetryAfterMs = 0L
-                safeLaunch { ensureMirrorInternal() }
-            } else {
-                note("Falhou: servidor scrcpy não encontrado no pacote.", ToastKind.ERROR)
-                toast("Falha ao preparar a transmissão.", ToastKind.ERROR)
-            }
         }
     }
 
