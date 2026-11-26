@@ -10,7 +10,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
-/** Paleta "Liquid Glass" noturna usada em toda a interface. */
+/** Paleta noturna usada em toda a interface. */
 object GlassColors {
     val bg: Color = Color(0xFF05060A)
     val glass: Color = Color(0xFF131722)

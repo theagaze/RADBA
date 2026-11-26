@@ -46,6 +46,7 @@ import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
@@ -158,7 +159,7 @@ class ScrcpyClient(
         error.value = ""
 
         return try {
-            onProgress?.invoke("Preparando servidor scrcpy…")
+            onProgress?.invoke("Preparando transmissão…")
             val prefs = prefsProvider()
             prepareAndPushJar(onProgress)
 
@@ -236,7 +237,7 @@ class ScrcpyClient(
 
     fun resetTier() {
         tierIndex = 0
-        mirrorStats.value = MirrorStats(currentTier().maxFps, 0, 0, currentTier().name)
+        mirrorStats.value = MirrorStats(0, 0, 0, currentTier().name)
     }
 
     /** Called when ADB goes offline so root fixes are rechecked on the next connection. */
@@ -245,11 +246,12 @@ class ScrcpyClient(
     }
 
     /**
-     * Mirrors the adaptive logic of RADB 0.2: downgrade after sustained stalls,
-     * upgrade only after a long stable period. Returns -1/down, +1/up, 0/no change.
+     * Refreshes the FPS/latency counters without touching the adaptive tier.
+     * Cheap enough to call every few seconds from any tab.
      */
-    fun checkNetworkAdapt(): Int {
-        val decoder = decoder ?: return 0
+    fun refreshStats() {
+        val decoder = decoder ?: return
+        if (!surfaceReady.value) return
         val fps = decoder.fps(1_500L)
         val lag = decoder.lagMs().toDouble()
         pipeMs = if (pipeMs == 0.0) lag else pipeMs * 0.8 + lag * 0.2
@@ -260,6 +262,16 @@ class ScrcpyClient(
             tier = tierIndex,
             tierName = tier.name,
         )
+    }
+
+    /**
+     * Mirrors the adaptive logic of RADB 0.2: downgrade after sustained stalls,
+     * upgrade only after a long stable period. Returns -1/down, +1/up, 0/no change.
+     */
+    fun checkNetworkAdapt(): Int {
+        val decoder = decoder ?: return 0
+        refreshStats()
+        val fps = decoder.fps(1_500L)
         if (!isReady()) return 0
         if (!surfaceReady.value) {
             // No TextureView attached: frame timestamps are intentionally idle,
@@ -274,7 +286,7 @@ class ScrcpyClient(
         val rendered = decoder.lastRenderedAt()
         val stall = lastPacketAtMs > 0L && rendered > 0L &&
             (lastPacketAtMs - rendered) > STALL_MS && (now - lastPacketAtMs) < 2_000L
-        val highLatency = pipeMs > 75.0 && rendered > 0L && (now - rendered) < 1_000L
+        val highLatency = pipeMs > 120.0 && rendered > 0L && (now - rendered) < 1_000L
 
         if (stall || highLatency) {
             if (lowSinceMs == 0L) {
@@ -401,7 +413,7 @@ class ScrcpyClient(
         lastAdaptMs = SystemClock.elapsedRealtime()
         lowSinceMs = 0L
         goodSinceMs = 0L
-        mirrorStats.value = MirrorStats(tier.maxFps, 0, tierIndex, tier.name)
+        mirrorStats.value = MirrorStats(0, 0, tierIndex, tier.name)
         // scrcpy parses scid with Integer.parseInt(value, 16), so it must be a
         // positive 31-bit value. Derive both the command and the socket name
         // from the same number so they always match.
@@ -486,7 +498,7 @@ class ScrcpyClient(
         try {
             while (video == null && System.currentTimeMillis() < deadline) {
                 checkGeneration(token)
-                if (serverGone()) throw IOException("o servidor scrcpy foi encerrado antes do vídeo")
+                if (serverGone()) throw IOException("o servidor de vídeo foi encerrado antes do vídeo")
                 try {
                     video = adb.openStream(destination)
                 } catch (t: Throwable) {
@@ -506,7 +518,7 @@ class ScrcpyClient(
 
             while (control == null && System.currentTimeMillis() < deadline) {
                 checkGeneration(token)
-                if (serverGone()) throw IOException("o servidor scrcpy foi encerrado antes do controle")
+                if (serverGone()) throw IOException("o servidor de vídeo foi encerrado antes do controle")
                 try {
                     control = adb.openStream(destination)
                 } catch (t: Throwable) {
@@ -550,25 +562,29 @@ class ScrcpyClient(
     private suspend fun readVideo(token: Int, stream: AdbStream, videoDecoder: VideoDecoder) =
         withContext(Dispatchers.IO) {
             val header = ByteArray(12)
-            val reader = ByteBuffer.allocate(12).order(ByteOrder.BIG_ENDIAN)
+            val reader = ByteBuffer.wrap(header).order(ByteOrder.BIG_ENDIAN)
+            // One watchdog for the whole stream instead of a scope + coroutine
+            // per frame: at 60 FPS the per-frame guards were a real cost.
+            val lastProgress = AtomicLong(SystemClock.elapsedRealtime())
+            val watchdog = scope.launch(Dispatchers.IO) {
+                while (isActive && token == generation && !stream.isClosed) {
+                    delay(1_000L)
+                    if (SystemClock.elapsedRealtime() - lastProgress.get() > VIDEO_READ_TIMEOUT_MS) {
+                        closeStream(stream)
+                        return@launch
+                    }
+                }
+            }
             try {
                 while (isActive && token == generation && !stream.isClosed) {
-                    val headerRead = withStreamGuard(stream, VIDEO_READ_TIMEOUT_MS) {
-                        readFully(stream, header, 0, header.size, token)
-                    }
-                    if (headerRead == null) throw IOException("tempo esgotado lendo cabeçalho de vídeo")
-                    reader.clear()
-                    reader.put(header)
+                    readFully(stream, header, 0, header.size, token, lastProgress)
                     val packedPts = reader.getLong(0)
                     val size = reader.getInt(8)
                     if (size <= 0 || size > MAX_PACKET_SIZE) {
                         throw IOException("tamanho de pacote de vídeo inválido: $size")
                     }
                     val payload = ByteArray(size)
-                    val payloadRead = withStreamGuard(stream, VIDEO_READ_TIMEOUT_MS) {
-                        readFully(stream, payload, 0, size, token)
-                    }
-                    if (payloadRead == null) throw IOException("tempo esgotado lendo dados de vídeo")
+                    readFully(stream, payload, 0, size, token, lastProgress)
                     lastPacketAtMs = SystemClock.elapsedRealtime()
                     val flags = when {
                         packedPts and CONFIG_FLAG != 0L -> MediaCodec.BUFFER_FLAG_CODEC_CONFIG
@@ -582,6 +598,8 @@ class ScrcpyClient(
                     error.value = "Vídeo interrompido: ${t.message ?: t::class.java.simpleName}"
                     stop()
                 }
+            } finally {
+                watchdog.cancel()
             }
         }
 
@@ -615,13 +633,14 @@ class ScrcpyClient(
         }
     }
 
-    private suspend fun readFully(
+    private fun readFully(
         stream: AdbStream,
         buffer: ByteArray,
         offset: Int,
         length: Int,
         token: Int,
-    ) = withContext(Dispatchers.IO) {
+        progress: AtomicLong? = null,
+    ) {
         var done = 0
         while (done < length) {
             checkGeneration(token)
@@ -629,6 +648,7 @@ class ScrcpyClient(
             val count = stream.read(buffer, offset + done, length - done)
             if (count <= 0) throw IOException("stream de vídeo fechado")
             done += count
+            progress?.set(SystemClock.elapsedRealtime())
         }
     }
 
@@ -709,9 +729,9 @@ class ScrcpyClient(
     private suspend fun prepareAndPushJar(onProgress: ((String) -> Unit)?) = jarLock.withLock {
         adb.withCritical {
             val jar = withTimeoutOrNull(30_000L) { prepareServerJar(onProgress) }
-                ?: throw IOException("tempo esgotado ao preparar o servidor scrcpy")
+                ?: throw IOException("tempo esgotado ao preparar o componente de vídeo")
             val pushed = withTimeoutOrNull(40_000L) { pushJarIfNeeded(jar, onProgress) }
-            if (pushed == null) throw IOException("tempo esgotado ao enviar o servidor scrcpy")
+            if (pushed == null) throw IOException("tempo esgotado ao enviar o componente de vídeo")
         }
     }
 
@@ -731,7 +751,7 @@ class ScrcpyClient(
             return@withContext fromAssets
         }
 
-        onProgress?.invoke("Baixando servidor scrcpy 2.7…")
+        onProgress?.invoke("Obtendo componente de vídeo…")
         val downloaded = downloadServerJar()
         if (!valid(downloaded)) throw IOException("servidor baixado inválido (tamanho ou SHA-256)")
         writeAtomically(local, downloaded)

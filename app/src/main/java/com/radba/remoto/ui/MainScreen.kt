@@ -17,12 +17,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -42,9 +40,6 @@ import com.radba.remoto.ui.theme.GlassColors
 @Composable
 fun MainScreen(viewModel: MainViewModel) {
     val state by viewModel.uiState.collectAsState()
-    val orientation = LocalConfiguration.current.orientation
-
-    LaunchedEffect(orientation) { viewModel.onOrientationChanged(orientation) }
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val compact = maxHeight < 520.dp
@@ -61,13 +56,24 @@ fun MainScreen(viewModel: MainViewModel) {
             ) {
                 Header(state.tab, state.connection, compact)
                 Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
-                    when (state.tab) {
-                        Tab.HOME -> HomeScreen(viewModel, state)
-                        Tab.APPS -> AppsScreen(viewModel, state)
-                        Tab.FILES -> FilesScreen(viewModel, state)
-                        Tab.PERF -> PerfScreen(viewModel, state)
-                        Tab.SETTINGS -> SettingsScreen(viewModel, state)
-                        Tab.TERMINAL -> TerminalScreen(viewModel, state)
+                    val homeVisible = state.tab == Tab.HOME
+                    // The mirror lives on Início. Keeping that screen composed
+                    // while another tab is open keeps its surface (and therefore
+                    // the running session) alive across tab switches.
+                    if (homeVisible || state.prefs.mirror) {
+                        HomeScreen(viewModel, state, showChrome = homeVisible)
+                    }
+                    if (!homeVisible) {
+                        Box(modifier = Modifier.fillMaxSize().background(GlassColors.bg)) {
+                            when (state.tab) {
+                                Tab.APPS -> AppsScreen(viewModel, state)
+                                Tab.FILES -> FilesScreen(viewModel, state)
+                                Tab.PERF -> PerfScreen(viewModel, state)
+                                Tab.SETTINGS -> SettingsScreen(viewModel, state)
+                                Tab.TERMINAL -> TerminalScreen(viewModel, state)
+                                Tab.HOME -> Unit
+                            }
+                        }
                     }
                 }
             }

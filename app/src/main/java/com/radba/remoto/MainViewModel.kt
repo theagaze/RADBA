@@ -104,6 +104,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val mirrorTier: String = "60 FPS Fluido",
         val mirrorFps: Int = 0,
         val mirrorLatencyMs: Int = 0,
+        val mirrorWidth: Int = 0,
+        val mirrorHeight: Int = 0,
         val blackout: Boolean = false,
         val brightnessPct: Int = 100,
         val warmPct: Int = 0,
@@ -162,8 +164,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var mirrorBusySinceMs = 0L
     private var mirrorFailStreak = 0
     private var lastOnline: Boolean? = false
-    private var lastOrientation = -1
-    private var pendingOrientationRestart = false
 
     @Volatile
     private var lastMirrorFrameAtMs = 0L
@@ -188,7 +188,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         adb.setHost(prefsFlow.value.host)
-        adb.startMonitor(viewModelScope, controlAlive = { scrcpy.isControlReady() }) { ok ->
+        adb.startMonitor(
+            viewModelScope,
+            controlAlive = { scrcpy.isControlReady() || scrcpy.isReady() },
+        ) { ok ->
             adb.online.value = ok
         }
 
@@ -229,7 +232,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             scrcpy.error.collect { error ->
                 if (error.isNotBlank()) {
                     _ui.update { it.copy(mirrorError = error) }
-                    logProblem("scrcpy: ${trunc(error, 220)}")
+                    logProblem("espelho: ${trunc(error, 220)}")
                 }
             }
         }
@@ -242,6 +245,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         mirrorLatencyMs = stats.pipeMs,
                     )
                 }
+            }
+        }
+        viewModelScope.launch {
+            scrcpy.deviceSize.collect { (width, height) ->
+                _ui.update { it.copy(mirrorWidth = width, mirrorHeight = height) }
             }
         }
 
@@ -451,6 +459,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (!adb.online.value) return
         val state = _ui.value
         if (state.mirrorState != MirrorState.ON || state.mirrorBusy) return
+        // Keep the FPS/latency counters live even while another tab is open.
+        scrcpy.refreshStats()
         // With no visible surface there are no rendered-frame timestamps, so
         // adaptation would misread a tab switch as a network stall and restart
         // the whole mirror. Only adapt while Home owns the surface.
@@ -473,19 +483,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ---------------------------------------------------------- conexao --
-
-    /** Restart only after a real rotation so the video size and touch map match the new layout. */
-    fun onOrientationChanged(orientation: Int) {
-        if (lastOrientation == orientation) return
-        val first = lastOrientation < 0
-        lastOrientation = orientation
-        if (first || !adb.online.value || !_ui.value.prefs.mirror) return
-        if (_ui.value.mirrorBusy || _ui.value.mirrorState != MirrorState.ON) {
-            pendingOrientationRestart = true
-            return
-        }
-        safeLaunch { restartMirrorInternal(announce = false) }
-    }
 
     fun selectTab(tab: Tab) {
         _ui.update { it.copy(tab = tab) }
@@ -660,15 +657,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         safeLaunch { ensureMirrorInternal() }
     }
 
-    private fun consumePendingOrientationRestart() {
-        if (!pendingOrientationRestart) return
-        if (SystemClock.elapsedRealtime() < mirrorRetryAfterMs) return
-        pendingOrientationRestart = false
-        if (adb.online.value && _ui.value.prefs.mirror) {
-            safeLaunch { restartMirrorInternal(announce = false) }
-        }
-    }
-
     private fun handleMirrorProgress(attempt: Int, message: String) {
         note(message, ToastKind.INFO)
         if (attempt == mirrorAttemptId) {
@@ -704,7 +692,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             noteAndToast(message, ToastKind.ERROR)
-            consumePendingOrientationRestart()
             return
         }
 
@@ -719,6 +706,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 safeLaunch { restartMirrorInternal(announce = false) }
                 return
             }
+            // A hidden mirror keeps decoding (the surface stays alive) but its
+            // frame proofs are only meaningful while the Início tab is shown.
+            if (state.tab != Tab.HOME) return
             if (frameAge > MIRROR_NO_FRAME_TIMEOUT_MS && now >= mirrorRetryAfterMs) {
                 mirrorRetryAfterMs = now + 5_000L
                 noteAndToast("Sem frames no espelho; reiniciando…", ToastKind.ERROR)
@@ -736,7 +726,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val attempt = ++mirrorAttemptId
         mirrorBusySinceMs = now
         _ui.update {
-            it.copy(mirrorBusy = true, mirrorError = "", mirrorProgress = "Iniciando scrcpy…")
+            it.copy(mirrorBusy = true, mirrorError = "", mirrorProgress = "Iniciando transmissão…")
         }
         try {
             scrcpy.setDisplayOff(_ui.value.blackout)
@@ -764,7 +754,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (attempt == mirrorAttemptId) {
                 mirrorBusySinceMs = 0L
                 _ui.update { it.copy(mirrorBusy = false) }
-                consumePendingOrientationRestart()
             }
         }
     }
@@ -774,7 +763,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val attempt = ++mirrorAttemptId
         mirrorBusySinceMs = SystemClock.elapsedRealtime()
         _ui.update {
-            it.copy(mirrorBusy = true, mirrorError = "", mirrorProgress = "Reiniciando scrcpy…")
+            it.copy(mirrorBusy = true, mirrorError = "", mirrorProgress = "Reiniciando transmissão…")
         }
         if (announce) note("Iniciando transmissão melhorada…", ToastKind.INFO)
         try {
@@ -810,7 +799,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 mirrorBusySinceMs = 0L
                 _ui.update { it.copy(mirrorBusy = false) }
                 refreshScreenshot()
-                consumePendingOrientationRestart()
             }
         }
     }

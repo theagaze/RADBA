@@ -11,7 +11,7 @@ import com.radba.remoto.ui.theme.RadbaTheme
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Tela cheia com barras do sistema translúcidas (visual "liquid glass").
+        // Tela cheia com as barras do sistema translúcidas.
         enableEdgeToEdge()
         setContent {
             RadbaTheme {

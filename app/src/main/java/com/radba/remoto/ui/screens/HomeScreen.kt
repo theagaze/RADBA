@@ -10,8 +10,10 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitPointerEvent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -20,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -43,6 +46,7 @@ import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
@@ -71,9 +75,20 @@ private val KEYS = listOf(
     "⏻" to 26,
 )
 
+/**
+ * Início: the live mirror plus remote controls.
+ *
+ * When [showChrome] is false the screen keeps only the video surface, so the
+ * session can stay alive behind another tab without showing or capturing any
+ * controls.
+ */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
+fun HomeScreen(
+    viewModel: MainViewModel,
+    state: MainViewModel.UiState,
+    showChrome: Boolean = true,
+) {
     var liveTextOpen by remember { mutableStateOf(false) }
     var liveDraft by remember { mutableStateOf("") }
     var controlsExpanded by remember { mutableStateOf(true) }
@@ -88,26 +103,27 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
     val stageMessage = when {
         state.connection == ConnectionState.DISCONNECTED -> "Projetor desconectado"
         state.prefs.mirror && state.mirrorError.isNotBlank() ->
-            "Transmissão melhorada (scrcpy) reconectando…\n${trunc(state.mirrorError, 110)}"
+            "Transmissão melhorada reconectando…\n${trunc(state.mirrorError, 110)}"
         waitingFrame -> "Aguardando primeiro frame…\n${trunc(progress, 110)}"
         mirrorOn -> null
-        state.prefs.mirror -> "Iniciando transmissão melhorada (scrcpy)…\n${trunc(progress, 110)}"
+        state.prefs.mirror -> "Iniciando transmissão melhorada…\n${trunc(progress, 110)}"
         state.screenshot != null -> null
         else -> state.screenshotStatus.ifBlank { "Aguardando conexão…" }
     }
 
     val status = when {
         state.connection == ConnectionState.DISCONNECTED -> "Desconectado"
-        state.prefs.mirror && state.mirrorError.isNotBlank() -> "Reconectando scrcpy…"
+        state.prefs.mirror && state.mirrorError.isNotBlank() -> "Reconectando…"
         waitingFrame -> "Aguardando primeiro frame…"
         mirrorOn -> buildString {
-            append("scrcpy · ")
             if (state.mirrorFps >= 1) {
                 append(state.mirrorFps.coerceAtMost(60)).append(" FPS")
+                if (state.mirrorLatencyMs > 0) {
+                    append(" · ").append(state.mirrorLatencyMs).append(" ms")
+                }
             } else {
                 append(state.mirrorTier)
             }
-            if (state.mirrorLatencyMs > 0) append(" · ").append(state.mirrorLatencyMs).append("ms")
         }
         state.prefs.mirror -> trunc(progress, 52)
         else -> state.screenshotStatus.ifBlank { "Aguardando…" }
@@ -123,12 +139,13 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
             var last = down.position
             while (true) {
                 val event = awaitPointerEvent(PointerEventPass.Main)
-                val change = event.changes.firstOrNull { it.id == down.id }
-                if (change != null && !change.pressed) {
+                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                change.consume()
+                if (!change.pressed) {
                     runCatching { viewModel.screenTouch(1, change.position.x, change.position.y) }
                     break
                 }
-                if (change != null && change.position != last) {
+                if (change.position != last) {
                     runCatching { viewModel.screenTouch(2, change.position.x, change.position.y) }
                     last = change.position
                 }
@@ -137,80 +154,113 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
     }
 
     Column(modifier = Modifier.fillMaxSize().background(GlassColors.bg)) {
-        Box(
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
-                .background(Color.Black)
-                .then(touchModifier),
+                .background(Color.Black),
         ) {
-            AndroidView(
+            // Render the video at its real aspect ratio, centered, so it is not
+            // stretched and the touch mapping (which assumes aspect-fit) matches
+            // exactly what the user sees.
+            val sourceWidth = when {
+                mirrorOn && state.mirrorWidth > 0 && state.mirrorHeight > 0 -> state.mirrorWidth
+                showShot -> screenshotBitmap?.width ?: 0
+                else -> 0
+            }
+            val sourceHeight = when {
+                mirrorOn && state.mirrorWidth > 0 && state.mirrorHeight > 0 -> state.mirrorHeight
+                showShot -> screenshotBitmap?.height ?: 0
+                else -> 0
+            }
+            val videoModifier = if (sourceWidth > 0 && sourceHeight > 0) {
+                val scale = minOf(
+                    maxWidth.value / sourceWidth.toFloat(),
+                    maxHeight.value / sourceHeight.toFloat(),
+                )
+                Modifier.size(
+                    width = (sourceWidth * scale).coerceAtLeast(1f).dp,
+                    height = (sourceHeight * scale).coerceAtLeast(1f).dp,
+                )
+            } else {
+                Modifier.fillMaxSize()
+            }
+
+            Box(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .alpha(if (showShot) 0f else 1f),
-                factory = { context ->
-                    var mirrorSurface: Surface? = null
-                    TextureView(context).apply {
-                        isOpaque = true
-                        surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                            override fun onSurfaceTextureAvailable(
-                                surfaceTexture: SurfaceTexture,
-                                width: Int,
-                                height: Int,
-                            ) {
-                                runCatching {
+                    .align(Alignment.Center)
+                    .then(videoModifier)
+                    .onSizeChanged { viewModel.updateMirrorView(it.width, it.height) }
+                    .then(if (showChrome) touchModifier else Modifier),
+            ) {
+                AndroidView(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .alpha(if (showShot) 0f else 1f),
+                    factory = { context ->
+                        var mirrorSurface: Surface? = null
+                        TextureView(context).apply {
+                            isOpaque = true
+                            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                                override fun onSurfaceTextureAvailable(
+                                    surfaceTexture: SurfaceTexture,
+                                    width: Int,
+                                    height: Int,
+                                ) {
+                                    runCatching {
+                                        val previous = mirrorSurface
+                                        val next = Surface(surfaceTexture)
+                                        mirrorSurface = next
+                                        viewModel.attachMirrorSurface(next)
+                                        viewModel.updateMirrorView(width, height)
+                                        viewModel.ensureMirror()
+                                        if (previous != null && previous !== next) {
+                                            Handler(Looper.getMainLooper()).postDelayed({
+                                                runCatching { previous.release() }
+                                            }, 500L)
+                                        }
+                                    }
+                                }
+
+                                override fun onSurfaceTextureSizeChanged(
+                                    surfaceTexture: SurfaceTexture,
+                                    width: Int,
+                                    height: Int,
+                                ) {
+                                    runCatching {
+                                        viewModel.updateMirrorView(width, height)
+                                        viewModel.ensureMirror()
+                                    }
+                                }
+
+                                override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
                                     val previous = mirrorSurface
-                                    val next = Surface(surfaceTexture)
-                                    mirrorSurface = next
-                                    viewModel.attachMirrorSurface(next)
-                                    viewModel.updateMirrorView(width, height)
-                                    viewModel.ensureMirror()
-                                    if (previous != null && previous !== next) {
+                                    if (previous != null) {
+                                        runCatching { viewModel.detachMirrorSurface(previous) }
                                         Handler(Looper.getMainLooper()).postDelayed({
                                             runCatching { previous.release() }
                                         }, 500L)
                                     }
+                                    mirrorSurface = null
+                                    return true
                                 }
-                            }
 
-                            override fun onSurfaceTextureSizeChanged(
-                                surfaceTexture: SurfaceTexture,
-                                width: Int,
-                                height: Int,
-                            ) {
-                                runCatching {
-                                    viewModel.updateMirrorView(width, height)
-                                    viewModel.ensureMirror()
+                                override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) {
+                                    viewModel.noteMirrorFrame()
                                 }
-                            }
-
-                            override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
-                                val previous = mirrorSurface
-                                if (previous != null) {
-                                    runCatching { viewModel.detachMirrorSurface(previous) }
-                                    Handler(Looper.getMainLooper()).postDelayed({
-                                        runCatching { previous.release() }
-                                    }, 500L)
-                                }
-                                mirrorSurface = null
-                                return true
-                            }
-
-                            override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) {
-                                viewModel.noteMirrorFrame()
                             }
                         }
-                    }
-                },
-            )
-
-            if (showShot && screenshotBitmap != null) {
-                Image(
-                    bitmap = screenshotBitmap,
-                    contentDescription = "Captura do projetor",
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize(),
+                    },
                 )
+
+                if (showShot && screenshotBitmap != null) {
+                    Image(
+                        bitmap = screenshotBitmap,
+                        contentDescription = "Captura do projetor",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
             }
 
             if (stageMessage != null) {
@@ -224,6 +274,8 @@ fun HomeScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 )
             }
         }
+
+        if (!showChrome) return@Column
 
         GlassCard(
             modifier = Modifier.fillMaxWidth(),

@@ -8,8 +8,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -34,7 +32,6 @@ import com.radba.remoto.MainViewModel
 import com.radba.remoto.data.ToastKind
 import com.radba.remoto.ui.components.GlassButton
 import com.radba.remoto.ui.components.GlassCard
-import com.radba.remoto.ui.components.GlassSheet
 import com.radba.remoto.ui.components.GlassSlider
 import com.radba.remoto.ui.components.GlassToggle
 import com.radba.remoto.ui.theme.GlassColors
@@ -48,7 +45,6 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
     var pairDialog by remember { mutableStateOf(false) }
     var pairAddress by remember { mutableStateOf(prefs.host.substringBefore(":") + ":") }
     var pairCode by remember { mutableStateOf("") }
-    var processesSheet by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -141,7 +137,7 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
 
         GlassCard {
             Text(
-                text = "Transmissão melhorada (scrcpy)",
+                text = "Transmissão melhorada",
                 color = GlassColors.text,
                 fontSize = 17.sp,
                 fontWeight = FontWeight.Bold,
@@ -149,27 +145,21 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
             GlassToggle(
                 checked = prefs.mirror,
                 onCheckedChange = { viewModel.setMirrorEnabled(it) },
-                label = "Transmissão melhorada (ao vivo)",
+                label = "Espelhamento ao vivo",
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             )
             Text(
-                text = "Servidor scrcpy v2.7 integrado no app, sem download e sem adb forward. " +
-                    "Perfil automático de 30 a 60 FPS conforme a rede. Ao desativar, usa captura periódica.",
+                text = "Perfil automático de 30 a 60 FPS conforme a rede. " +
+                    "Ao desativar, usa captura periódica.",
                 color = GlassColors.sub,
                 fontSize = 11.sp,
                 modifier = Modifier.padding(top = 6.dp),
             )
             Text(
-                text = "Perfil ativo: ${state.mirrorTier} · ${state.mirrorFps} FPS · ${state.mirrorLatencyMs}ms",
+                text = "Perfil ativo: ${state.mirrorTier} · ${state.mirrorFps} FPS · ${state.mirrorLatencyMs} ms",
                 color = GlassColors.acc,
                 fontSize = 11.sp,
                 modifier = Modifier.padding(top = 6.dp),
-            )
-            Text(
-                text = "scrcpy v2.7 integrado · perfil automático 30–60 FPS",
-                color = GlassColors.sub,
-                fontSize = 11.sp,
-                modifier = Modifier.padding(top = 4.dp),
             )
             Row(
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
@@ -292,38 +282,6 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
         }
 
         GlassCard {
-            Text(text = "Sistema e controles", color = GlassColors.text, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-            Text(
-                text = "Use a aba Desempenho para cpu, RAM, armazenamento e ficha técnica.",
-                color = GlassColors.sub,
-                fontSize = 11.sp,
-                modifier = Modifier.padding(top = 6.dp),
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                GlassButton(
-                    "Processos",
-                    onClick = {
-                        viewModel.refreshProcesses()
-                        processesSheet = true
-                    },
-                    modifier = Modifier.weight(1f),
-                    compact = true,
-                )
-                GlassButton(
-                    "Acordar tela",
-                    { viewModel.wakeScreen() },
-                    modifier = Modifier.weight(1f),
-                    compact = true,
-                    selected = true,
-                )
-                GlassButton("Atualizar info", { viewModel.refreshSettings() }, modifier = Modifier.weight(1f), compact = true)
-            }
-        }
-
-        GlassCard {
             Text(
                 text = "Diagnóstico de erros",
                 color = GlassColors.text,
@@ -430,39 +388,6 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 ) { Text(text = "Cancelar", color = GlassColors.sub) }
             },
         )
-    }
-
-    if (processesSheet) {
-        GlassSheet(
-            title = "Processos",
-            subtitle = "${state.processes.size} processos",
-            onDismiss = { processesSheet = false },
-        ) {
-            LazyColumn(modifier = Modifier.heightIn(max = 380.dp)) {
-                items(state.processes, key = { it.pid }) { process ->
-                    Column(modifier = Modifier.padding(vertical = 6.dp)) {
-                        Text(
-                            text = "${process.pid} · ${process.name}",
-                            color = GlassColors.text,
-                            fontSize = 12.sp,
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            GlassButton(
-                                "Matar",
-                                onClick = { viewModel.killProcess(process.pid) },
-                                compact = true,
-                                danger = true,
-                            )
-                            GlassButton(
-                                "Forçar parada",
-                                onClick = { viewModel.forceStopPackage(process.name.substringBefore(":")) },
-                                compact = true,
-                            )
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 

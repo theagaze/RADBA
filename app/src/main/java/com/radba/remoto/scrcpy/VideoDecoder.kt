@@ -13,10 +13,11 @@ import java.util.ArrayDeque
 /**
  * A small synchronous MediaCodec H.264 decoder driven by a dedicated thread.
  *
- * The decoder owns its thread and its MediaCodec instance. Surfaces may be
- * attached, detached or replaced at any time: a change is picked up by the
- * decoding thread, which releases the old codec and configures a new one with
- * the current surface.
+ * The decoder owns its thread and its MediaCodec instance. When the view
+ * surface is replaced (rotation, view recreation) the running codec is handed
+ * over with [MediaCodec.setOutputSurface], so the stream keeps flowing without
+ * waiting for a new key frame. A full codec rebuild is used only when the hand
+ * over is not possible.
  */
 class VideoDecoder : Closeable {
     /** True while a MediaCodec is configured and started. */
@@ -64,8 +65,15 @@ class VideoDecoder : Closeable {
     @Volatile
     private var lastRenderedAtMs = 0L
 
+    /** Measured delay between receiving a packet and rendering its frame. */
+    @Volatile
+    private var lastLatencyMs = 0L
+
     private val packets = ArrayDeque<EncodedPacket>()
     private val frameTimes = ArrayDeque<Long>()
+
+    /** Presentation timestamp -> elapsed realtime when the packet was received. */
+    private val feedStamps = LinkedHashMap<Long, Long>()
 
     /** Last SPS/PPS access unit, replayed whenever the codec is recreated. */
     @Volatile
@@ -103,11 +111,10 @@ class VideoDecoder : Closeable {
         if (closed || surfaceRef === surface) return
         surfaceRef = surface
         surfaceGeneration++
-        expectKeyFrame = true
-        // Invalidate frame proofs synchronously: a buffer already in flight was
-        // encoded for the previous Surface and must not satisfy startup.
-        firstFrame.value = false
-        frameReceived.value = false
+        if (surface == null) {
+            // No consumer: nothing can be rendered until a new surface arrives.
+            firstFrame.value = false
+        }
         synchronized(lock) { (lock as java.lang.Object).notifyAll() }
     }
 
@@ -119,7 +126,8 @@ class VideoDecoder : Closeable {
     /** Queue one encoded access unit. [flags] use MediaCodec.BUFFER_FLAG_*. */
     fun feed(data: ByteArray, flags: Int, ptsUs: Long) {
         if (closed) return
-        lastFedAtMs = SystemClock.elapsedRealtime()
+        val now = SystemClock.elapsedRealtime()
+        lastFedAtMs = now
         val isConfig = flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
         val isKey = flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
         if (expectKeyFrame && !isConfig && !isKey) {
@@ -150,19 +158,28 @@ class VideoDecoder : Closeable {
         synchronized(lock) {
             val config = pendingConfig
             pendingConfig = null
-            val payload = if (config == null) data.copyOf() else config + data
+            // [data] is a freshly allocated packet owned by this decoder, so it
+            // can be queued without an extra copy.
+            val payload = if (config == null) data else config + data
             if (packets.size >= MAX_PENDING) {
-                val iterator = packets.iterator()
-                var removed = false
-                while (iterator.hasNext() && !removed) {
-                    if (!isCritical(iterator.next())) {
-                        iterator.remove()
-                        removed = true
-                    }
+                // The decoder is behind. Keeping a partial GOP would corrupt the
+                // picture until the next key frame, so restart from a clean IDR.
+                packets.clear()
+                if (!isKey) {
+                    expectKeyFrame = true
+                    return@synchronized
                 }
-                if (!removed) packets.removeFirst()
             }
             packets.addLast(EncodedPacket(payload, flags, ptsUs))
+            synchronized(feedStamps) {
+                feedStamps[ptsUs] = now
+                while (feedStamps.size > MAX_FEED_STAMPS) {
+                    val oldest = feedStamps.keys.iterator()
+                    if (!oldest.hasNext()) break
+                    oldest.next()
+                    oldest.remove()
+                }
+            }
             (lock as java.lang.Object).notifyAll()
         }
     }
@@ -180,12 +197,12 @@ class VideoDecoder : Closeable {
 
     fun lastRenderedAt(): Long = lastRenderedAtMs
 
-    /** Approximate queue delay between the newest fed packet and rendered frame. */
-    fun lagMs(): Long {
-        val fed = lastFedAtMs
-        val rendered = lastRenderedAtMs
-        return if (fed > 0L && rendered >= fed) rendered - fed else 0L
-    }
+    /**
+     * Real pipeline delay: elapsed time between receiving the encoded packet and
+     * rendering the decoded frame that came from it. Returns 0 until a frame has
+     * been rendered.
+     */
+    fun lagMs(): Long = lastLatencyMs
 
     /** Signal that no more encoded data will arrive. */
     fun signalEndOfStream() {
@@ -214,7 +231,7 @@ class VideoDecoder : Closeable {
         endOfStream = false
         configured.value = false
         synchronized(frameTimes) { frameTimes.clear() }
-        thread = Thread({ decodeLoop() }, "scrcpy-decoder").apply {
+        thread = Thread({ decodeLoop() }, "video-decoder").apply {
             isDaemon = true
             start()
         }
@@ -222,30 +239,44 @@ class VideoDecoder : Closeable {
 
     private fun decodeLoop() {
         var codec: MediaCodec? = null
-        var seenGeneration = -1
-        var purgedGeneration = -1
+        var codecSurface: Surface? = null
+        var codecGeneration = -1
         var inputEosSent = false
         try {
             while (!closed) {
-                if (codec == null || seenGeneration != surfaceGeneration) {
-                    val surfaceChanged = purgedGeneration != surfaceGeneration
-                    seenGeneration = surfaceGeneration
-                    if (surfaceChanged) {
-                        // Packets decoded for the old codec are not valid for
-                        // the new one; drop them and wait for a fresh IDR.
-                        synchronized(lock) { packets.clear() }
-                        purgedGeneration = surfaceGeneration
+                val target = surfaceRef
+                val generation = surfaceGeneration
+                if (codec == null || codecGeneration != generation) {
+                    // Prefer a zero-copy surface hand over: decoded frames keep
+                    // flowing to the new view without an IDR wait.
+                    if (codec != null && codecSurface != null && target != null) {
+                        val swapped = try {
+                            codec.setOutputSurface(target)
+                            true
+                        } catch (_: Throwable) {
+                            false
+                        }
+                        if (swapped) {
+                            codecSurface = target
+                            codecGeneration = generation
+                            continue
+                        }
                     }
-                    expectKeyFrame = true
                     releaseCodec(codec)
                     codec = null
+                    codecSurface = null
+                    codecGeneration = generation
                     inputEosSent = false
                     configured.value = false
+                    // Packets decoded for the old codec are not valid for the
+                    // new one; drop them and wait for a fresh IDR.
+                    synchronized(lock) { packets.clear() }
+                    expectKeyFrame = true
                     firstFrame.value = false
-                    frameReceived.value = false
                     try {
-                        val newCodec = createCodec(surfaceRef, width, height, mimeType)
+                        val newCodec = createCodec(target, width, height, mimeType)
                         codec = newCodec
+                        codecSurface = target
                         configured.value = true
                         error.value = ""
                         // scrcpy sends SPS/PPS only once; replay them before the
@@ -268,14 +299,11 @@ class VideoDecoder : Closeable {
                 }
 
                 val activeCodec = codec ?: continue
-                val outputDone = drainOutput(activeCodec, seenGeneration)
+                val hasPackets = synchronized(lock) { packets.isNotEmpty() }
+                drainOutput(activeCodec, codecGeneration, if (hasPackets) 0L else OUTPUT_TIMEOUT_US)
 
                 if (inputEosSent) {
-                    if (outputDone) {
-                        // End of stream fully drained; keep the decoder alive in case
-                        // the surface is replaced and new data arrives.
-                        waitForWork(50L)
-                    }
+                    waitForWork(20L)
                     continue
                 }
 
@@ -342,6 +370,8 @@ class VideoDecoder : Closeable {
                 if (++stalled > MAX_ENQUEUE_ATTEMPTS) {
                     throw IOException("codec sem buffers de entrada disponíveis")
                 }
+                // Free decoded buffers before retrying the input side.
+                drainOutput(codec, surfaceGeneration, 0L)
                 waitForWork(1L)
                 continue
             }
@@ -362,12 +392,12 @@ class VideoDecoder : Closeable {
         }
     }
 
-    private fun drainOutput(codec: MediaCodec, generation: Int): Boolean {
+    private fun drainOutput(codec: MediaCodec, generation: Int, timeoutUs: Long): Boolean {
         val info = MediaCodec.BufferInfo()
         var reachedEos = false
         while (!closed && generation == surfaceGeneration) {
             val index = try {
-                codec.dequeueOutputBuffer(info, OUTPUT_TIMEOUT_US)
+                codec.dequeueOutputBuffer(info, timeoutUs)
             } catch (t: Throwable) {
                 handleCodecFailure(t)
                 return reachedEos
@@ -395,9 +425,14 @@ class VideoDecoder : Closeable {
                         return reachedEos
                     }
                     if (render) {
-                        lastRenderedAtMs = SystemClock.elapsedRealtime()
+                        val now = SystemClock.elapsedRealtime()
+                        lastRenderedAtMs = now
+                        val fedAt = synchronized(feedStamps) {
+                            feedStamps.remove(info.presentationTimeUs)
+                        }
+                        if (fedAt != null && now >= fedAt) lastLatencyMs = now - fedAt
                         synchronized(frameTimes) {
-                            frameTimes.addLast(lastRenderedAtMs)
+                            frameTimes.addLast(now)
                             while (frameTimes.size > 120) frameTimes.removeFirst()
                         }
                         if (!firstFrame.value) firstFrame.value = true
@@ -471,19 +506,18 @@ class VideoDecoder : Closeable {
         }
     }
 
-    private fun isCritical(packet: EncodedPacket): Boolean =
-        (packet.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0 ||
-            (packet.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-
     private data class EncodedPacket(val data: ByteArray, val flags: Int, val ptsUs: Long)
 
     private companion object {
-        const val INPUT_TIMEOUT_US = 20_000L
-        const val OUTPUT_TIMEOUT_US = 2_000L
+        const val INPUT_TIMEOUT_US = 8_000L
+        const val OUTPUT_TIMEOUT_US = 4_000L
         const val MAX_INPUT_SIZE = 8 * 1024 * 1024
         const val SOFTWARE_DECODER_C2 = "c2.android.avc.decoder"
         const val SOFTWARE_DECODER_OMX = "OMX.google.h264.decoder"
-        const val MAX_PENDING = 48
-        const val MAX_ENQUEUE_ATTEMPTS = 5_000
+
+        /** At most ~400 ms of video at 60 FPS; keeps latency bounded. */
+        const val MAX_PENDING = 24
+        const val MAX_FEED_STAMPS = 240
+        const val MAX_ENQUEUE_ATTEMPTS = 200
     }
 }
