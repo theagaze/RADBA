@@ -15,11 +15,13 @@ import com.radba.remoto.adb.DeviceServices
 import com.radba.remoto.adb.PqController
 import com.radba.remoto.adb.ShellResult
 import com.radba.remoto.data.AppInfo
+import com.radba.remoto.data.AppMeta
 import com.radba.remoto.data.AppPreferences
 import com.radba.remoto.data.ConnectionState
+import com.radba.remoto.data.DeviceInfo
 import com.radba.remoto.data.FileEntry
-import com.radba.remoto.data.MediaInfo
 import com.radba.remoto.data.MirrorState
+import com.radba.remoto.data.PerfStats
 import com.radba.remoto.data.PictureBase
 import com.radba.remoto.data.Prefs
 import com.radba.remoto.data.ProcessInfo
@@ -32,8 +34,6 @@ import com.radba.remoto.data.ToastKind
 import com.radba.remoto.data.ToastMessage
 import com.radba.remoto.scrcpy.ScrcpyClient
 import com.radba.remoto.util.clampInt
-import com.radba.remoto.util.encoderLabel
-import com.radba.remoto.util.fpsServerValue
 import com.radba.remoto.util.inputTextCommand
 import com.radba.remoto.util.isInternalRoot
 import com.radba.remoto.util.normalizeRemote
@@ -43,9 +43,10 @@ import com.radba.remoto.util.splitHost
 import com.radba.remoto.util.trunc
 import com.radba.remoto.util.volumeLevel
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.SharedFlow
@@ -56,14 +57,14 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.abs
-import kotlin.math.roundToInt
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     data class UiState(
@@ -80,31 +81,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val filesPath: String = "/sdcard",
         val files: List<FileEntry> = emptyList(),
         val settingsNote: SettingsNote? = null,
-        val systemInfo: String = "Conecte o projetor…",
-        val encoders: List<String> = listOf(
-            "auto", "hardware (padrão)", "c2.android.avc.encoder", "OMX.google.h264.encoder",
-        ),
         val volumePct: Int = 100,
         val volumeMax: Int = 15,
-        val terminalLines: List<TerminalLine> = listOf(
-            TerminalLine("$ digite um comando e pressione Enter", TerminalKind.SUB),
-        ),
+        val terminalLines: List<TerminalLine> = emptyList(),
         val terminalDraft: String = "",
         val terminalBusy: Boolean = false,
         val mirrorState: MirrorState = MirrorState.OFF,
         val mirrorError: String = "",
-        val activeEncoder: String = "",
-        val deviceSize: Pair<Int, Int> = 1280 to 720,
-        val serverFps: Int = 0,
+        val mirrorTier: String = "60 FPS Fluido",
+        val mirrorFps: Int = 0,
+        val mirrorLatencyMs: Int = 0,
         val blackout: Boolean = false,
-        val media: MediaInfo = MediaInfo(),
-        val mediaNow: Double = 0.0,
         val brightnessPct: Int = 100,
         val warmPct: Int = 0,
         val mirrorBusy: Boolean = false,
         val installing: Boolean = false,
         val screenshot: Bitmap? = null,
         val screenshotStatus: String = "Aguardando…",
+        val perf: PerfStats? = null,
+        val deviceInfo: DeviceInfo = DeviceInfo(),
+        val cpuHistory: List<Float> = emptyList(),
+        val ramHistory: List<Float> = emptyList(),
     )
 
     private val ctx: Application = getApplication()
@@ -138,9 +135,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val reconnecting = AtomicBoolean(false)
     private val installingGuard = AtomicBoolean(false)
     private val screenshotBusy = AtomicBoolean(false)
+    private val perfBusy = AtomicBoolean(false)
+    private val deviceBusy = AtomicBoolean(false)
+    private val appMetaBusy = AtomicBoolean(false)
     private val coalescedJobs = ConcurrentHashMap<String, Job>()
+    private val metaCache = ConcurrentHashMap<String, AppMeta>()
     private val terminalHistory = mutableListOf<String>()
     private var terminalIndex = -1
+    private var terminalJob: Job? = null
+    private var metaGeneration = 0
     private var volumeHoldUntilMs = 0L
     private var lastVdimErrorMs = 0L
     private var mirrorRetryAfterMs = 0L
@@ -181,15 +184,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             scrcpy.error.collect { error -> _ui.update { it.copy(mirrorError = error) } }
         }
         viewModelScope.launch {
-            scrcpy.activeEncoder.collect { encoder -> _ui.update { it.copy(activeEncoder = encoder) } }
-        }
-        viewModelScope.launch {
-            scrcpy.deviceSize.collect { size ->
-                if (size.first > 0 && size.second > 0) _ui.update { it.copy(deviceSize = size) }
+            scrcpy.mirrorStats.collect { stats ->
+                _ui.update {
+                    it.copy(
+                        mirrorTier = stats.tierName,
+                        mirrorFps = stats.fps,
+                        mirrorLatencyMs = stats.pipeMs,
+                    )
+                }
             }
-        }
-        viewModelScope.launch {
-            scrcpy.serverFps.collect { fps -> _ui.update { it.copy(serverFps = fps) } }
         }
 
         reconnecting.set(true)
@@ -206,6 +209,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
+        periodic(2_000L) {
+            if (_ui.value.tab == Tab.PERF && adb.online.value) refreshPerfInternal()
+        }
+        periodic(2_500L) { ensureMirrorInternal() }
+        periodic(4_000L) { fourSecondTick() }
         periodic(5_000L) { fiveSecondTick() }
         periodic(15_000L) { refreshVolumeInternal() }
     }
@@ -270,11 +278,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun shellDetail(result: ShellResult, max: Int = 110): String =
         trunc(detail(result), max)
 
-    private fun localServerAvailable(): Boolean {
-        val assets = runCatching { ctx.assets.list("") }.getOrNull() ?: emptyArray()
-        return assets.contains("scrcpy-server.jar") || File(ctx.filesDir, "scrcpy-server.jar").exists()
-    }
-
     private fun applyReconnectResult(result: Result<Unit>, showMessages: Boolean) {
         if (result.isSuccess) {
             if (showMessages) {
@@ -316,11 +319,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 refreshVolumeInternal()
                 refreshSettingsInternal()
                 refreshRootFeatures()
-                refreshScreenshot()
-                if (_ui.value.tab == Tab.HOME) ensureMirrorInternal()
+                when (_ui.value.tab) {
+                    Tab.APPS -> appsShown()
+                    Tab.FILES -> reloadFiles()
+                    Tab.PERF -> refreshPerf()
+                    else -> Unit
+                }
+                ensureMirrorInternal()
+                if (!_ui.value.prefs.mirror) refreshScreenshot()
             }
         } else {
             scrcpy.stop()
+            scrcpy.resetTier()
             coalescedJobs.keys.toList().forEach { coalescedJobs[it]?.cancel() }
             coalescedJobs.clear()
             mirrorRetryAfterMs = 0L
@@ -330,40 +340,46 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     connectionText = "Desconectado",
                     mirrorState = MirrorState.OFF,
                     mirrorError = "",
-                    activeEncoder = "",
-                    serverFps = 0,
                     mirrorBusy = false,
                     rootStatus = RootStatus(),
                     screenshot = null,
-                    screenshotStatus = "Projetor desconectado",
-                    systemInfo = "Conecte o projetor…",
+                    screenshotStatus = "Desconectado",
                 )
             }
         }
     }
 
-    private suspend fun fiveSecondTick() {
+    private suspend fun fourSecondTick() {
         if (!adb.online.value) return
         val state = _ui.value
-        if (state.tab != Tab.HOME) return
-        if (!scrcpy.isReady()) {
-            refreshScreenshot()
-            ensureMirrorInternal()
+        if (state.mirrorState != MirrorState.ON || state.mirrorBusy) return
+        when (scrcpy.checkNetworkAdapt()) {
+            -1 -> {
+                note("Rede instável: reduzindo para ${scrcpy.currentTier().name}.", ToastKind.INFO)
+                restartMirrorInternal(announce = false)
+            }
+            1 -> {
+                note("Rede estável: subindo para ${scrcpy.currentTier().name}.", ToastKind.INFO)
+                restartMirrorInternal(announce = false)
+            }
         }
-        pollMedia()
+    }
+
+    private suspend fun fiveSecondTick() {
+        if (!adb.online.value || _ui.value.prefs.mirror || scrcpy.isReady()) return
+        if (_ui.value.tab == Tab.HOME) refreshScreenshot()
     }
 
     // ---------------------------------------------------------- conexao --
 
     fun selectTab(tab: Tab) {
-        val previous = _ui.value.tab
         _ui.update { it.copy(tab = tab) }
-        if (tab != Tab.HOME && previous == Tab.HOME) {
-            scrcpy.stop()
-            _ui.update { it.copy(mirrorState = MirrorState.OFF, mirrorBusy = false) }
-        } else if (tab == Tab.HOME && previous != Tab.HOME) {
-            mirrorRetryAfterMs = 0L
-            safeLaunch { ensureMirrorInternal() }
+        when (tab) {
+            Tab.HOME -> safeLaunch { ensureMirrorInternal() }
+            Tab.APPS -> appsShown()
+            Tab.FILES -> reloadFiles()
+            Tab.PERF -> refreshPerf()
+            else -> Unit
         }
     }
 
@@ -494,28 +510,55 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         scrcpy.setViewSize(width, height)
     }
 
-    /** Restore the mirror when safe; surface callbacks must not force a restart. */
+    /** Surface callbacks restore the stream; they never force a restart. */
     fun ensureMirror() {
         safeLaunch { ensureMirrorInternal() }
     }
 
     private suspend fun ensureMirrorInternal() {
         val state = _ui.value
-        if (state.tab != Tab.HOME || !state.prefs.mirror || !adb.online.value) return
+        if (!state.prefs.mirror || !adb.online.value) return
         if (scrcpy.isReady() || state.mirrorBusy) return
         if (SystemClock.elapsedRealtime() < mirrorRetryAfterMs) return
         _ui.update { it.copy(mirrorBusy = true) }
         try {
             val ok = scrcpy.start { message -> note(message, ToastKind.INFO) }
-            if (ok) {
-                if (_ui.value.blackout) scrcpy.setDisplayPower(false)
-            } else {
-                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 25_000L
-                toast("Espelho: ${trunc(scrcpy.error.value, 70)}", ToastKind.ERROR)
+            if (ok && _ui.value.blackout) scrcpy.setDisplayPower(false)
+            if (!ok) mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
+            refreshScreenshot()
+        } catch (t: Throwable) {
+            mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
+            toast("Espelho: ${trunc(t.message ?: "falha", 70)}", ToastKind.ERROR)
+        } finally {
+            _ui.update { it.copy(mirrorBusy = false) }
+        }
+    }
+
+    private suspend fun restartMirrorInternal(announce: Boolean) {
+        if (!adb.online.value || _ui.value.mirrorBusy) return
+        _ui.update { it.copy(mirrorBusy = true) }
+        if (announce) note("Iniciando transmissão melhorada…", ToastKind.INFO)
+        try {
+            scrcpy.stop()
+            val ok = scrcpy.start { message -> note(message, ToastKind.INFO) }
+            if (ok && _ui.value.blackout) scrcpy.setDisplayPower(false)
+            if (!ok) {
+                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
+                if (announce) {
+                    val reason = scrcpy.error.value.ifBlank { "motivo desconhecido" }
+                    note("Espelho falhou: ${trunc(reason, 320)}", ToastKind.ERROR)
+                    toast("Espelho falhou (detalhes em Ajustes).", ToastKind.ERROR)
+                }
+            } else if (announce) {
+                note("Transmissão melhorada ativa. Veja na tela Início.", ToastKind.OK)
+                toast("Espelho ativo.", ToastKind.OK)
             }
         } catch (t: Throwable) {
-            mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 25_000L
-            toast("Espelho: ${trunc(t.message ?: "falha", 70)}", ToastKind.ERROR)
+            mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 2_500L
+            if (announce) {
+                note("Espelho falhou: ${trunc(failureDetail(t), 320)}", ToastKind.ERROR)
+                toast("Espelho falhou (detalhes em Ajustes).", ToastKind.ERROR)
+            }
         } finally {
             _ui.update { it.copy(mirrorBusy = false) }
             refreshScreenshot()
@@ -531,31 +574,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             note("O espelho já está iniciando…", ToastKind.INFO)
             return
         }
-        _ui.update { it.copy(mirrorBusy = true) }
-        note("Iniciando espelho (pode levar alguns segundos)…", ToastKind.INFO)
-        safeLaunch {
-            try {
-                scrcpy.stop()
-                val ok = scrcpy.start { message -> note(message, ToastKind.INFO) }
-                if (ok) {
-                    if (_ui.value.blackout) scrcpy.setDisplayPower(false)
-                    note("Espelho ao vivo ativo. Veja na tela Início.", ToastKind.OK)
-                    toast("Espelho ativo.", ToastKind.OK)
-                } else {
-                    val reason = scrcpy.error.value.ifBlank { "motivo desconhecido" }
-                    note("Espelho falhou: ${trunc(reason, 320)}", ToastKind.ERROR)
-                    toast("Espelho falhou (detalhes em Ajustes).", ToastKind.ERROR)
-                    mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 25_000L
-                }
-            } catch (t: Throwable) {
-                note("Espelho falhou: ${trunc(failureDetail(t), 320)}", ToastKind.ERROR)
-                toast("Espelho falhou (detalhes em Ajustes).", ToastKind.ERROR)
-                mirrorRetryAfterMs = SystemClock.elapsedRealtime() + 25_000L
-            } finally {
-                _ui.update { it.copy(mirrorBusy = false) }
-                refreshScreenshot()
-            }
-        }
+        safeLaunch { restartMirrorInternal(announce = true) }
     }
 
     fun stopMirror() {
@@ -563,7 +582,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         mirrorRetryAfterMs = 0L
         _ui.update { it.copy(mirrorState = MirrorState.OFF, mirrorBusy = false) }
         toast("Espelho desligado.", ToastKind.INFO)
-        refreshScreenshot()
+        safeLaunch { refreshScreenshot() }
     }
 
     fun screenTouch(action: Int, x: Float, y: Float) {
@@ -597,44 +616,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun mediaSeek(seconds: Int) {
-        if (seconds == 0 || !adb.online.value) return
-        val code = if (seconds > 0) 90 else 89
-        val count = (abs(seconds.toFloat()) / 10f).roundToInt().coerceIn(1, 60)
-        if (!scrcpy.sendKeys(List(count) { code })) {
-            safeLaunch {
-                repeat(count) { adb.shell("input keyevent $code") }
-            }
-        }
-        val next = maxOf(0.0, _ui.value.mediaNow + seconds)
-        _ui.update { state ->
-            val updated = if (state.media.duration > 0.0) {
-                state.media.copy(position = next.coerceAtMost(state.media.duration))
-            } else {
-                state.media
-            }
-            state.copy(mediaNow = next, media = updated)
-        }
-    }
-
-    fun seekToFraction(frac: Float) {
-        val duration = _ui.value.media.duration
-        if (duration <= 0.0) return
-        val target = (frac.coerceIn(0f, 1f) * duration).toDouble()
-        mediaSeek((target - _ui.value.mediaNow).roundToInt())
-    }
-
-    fun pollMedia() {
-        if (!adb.online.value) return
+    fun toggleAudioPc() {
+        val enabled = !prefsFlow.value.audioPc
         safeLaunch {
-            val info = runCatching { services.mediaInfo() }.getOrNull() ?: return@safeLaunch
-            _ui.update {
-                it.copy(
-                    media = info,
-                    mediaNow = if (info.position > 0.0) info.position else it.mediaNow,
-                )
-            }
+            prefsStore.update { it.copy(audioPc = enabled) }
+            _ui.update { it.copy(prefs = it.prefs.copy(audioPc = enabled)) }
         }
+        noteAndToast(
+            "Som no PC é exclusivo do desktop; preferência salva como ${if (enabled) "ativada" else "desativada"}.",
+            ToastKind.INFO,
+        )
     }
 
     // ------------------------------------------------------- screenshot --
@@ -643,26 +634,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (!screenshotBusy.compareAndSet(false, true)) return
         safeLaunch {
             try {
-                val bytes = if (adb.online.value) runCatching { services.screenshot() }.getOrNull() else null
+                val captureEnabled = adb.online.value && !_ui.value.prefs.mirror
+                val bytes = if (captureEnabled) runCatching { services.screenshot() }.getOrNull() else null
                 val bitmap = if (bytes != null && bytes.isNotEmpty()) {
                     runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }.getOrNull()
                 } else {
                     null
                 }
                 if (bitmap == null) {
-                    val status = if (adb.online.value) {
-                        "Sem captura (tela bloqueada ou sem permissão)"
-                    } else {
-                        "Projetor desconectado"
+                    val status = when {
+                        !adb.online.value -> "Desconectado"
+                        _ui.value.prefs.mirror -> "Aguardando espelho…"
+                        else -> "Sem captura (tela bloqueada ou sem permissão)"
                     }
                     _ui.update { it.copy(screenshot = null, screenshotStatus = status) }
                 } else {
-                    var status = "Captura " + SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-                    if (!localServerAvailable()) {
-                        status += " · baixe a transmissão em Ajustes"
-                    } else if (_ui.value.mirrorError.isNotBlank()) {
-                        status += " · ${trunc(_ui.value.mirrorError, 60)}"
-                    }
+                    val status = "Captura " + SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date()) +
+                        " (desativada)"
                     _ui.update { it.copy(screenshot = bitmap, screenshotStatus = status) }
                 }
             } finally {
@@ -678,7 +666,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val info = runCatching { services.getVolume() }.getOrNull() ?: return
         if (SystemClock.elapsedRealtime() - volumeHoldUntilMs <= 2_500L) return
         val max = if (info.max > 0) info.max else 15
-        val pct = ((info.level.toFloat() / max.toFloat()) * 100f).roundToInt().coerceIn(0, 100)
+        val pct = ((info.level.toFloat() / max.toFloat()) * 100f).roundToIntCompat().coerceIn(0, 100)
         _ui.update { it.copy(volumeMax = max, volumePct = pct) }
     }
 
@@ -701,7 +689,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         setVolumePct(_ui.value.volumePct + delta)
     }
 
-    // --------------------------------------------------------- brilho/root --
+    // ------------------------------------------------------- brilho/root --
 
     private fun applyVdim(pct: Int, warm: Int) {
         coalesce("vdim") {
@@ -765,6 +753,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         nightWarm = state.warmPct.coerceIn(0, 100),
                     )
                 }
+                _ui.update { current ->
+                    current.copy(
+                        prefs = current.prefs.copy(
+                            nightBright = state.brightnessPct.coerceIn(10, 99),
+                            nightWarm = state.warmPct.coerceIn(0, 100),
+                        ),
+                    )
+                }
             }
             setBrightness(100, 0)
         } else {
@@ -790,35 +786,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _ui.update { it.copy(rootStatus = status) }
         if (status.available != true) return
         val current = prefsFlow.value
-        // Always reapply: a previous session may have left SurfaceFlinger
-        // overridden even when the saved preferences are back at defaults.
-        runCatching { applyVideoFixInternal(disable = current.rootFixVideo) }
-        runCatching { services.applyVirtualBrightness(current.vBright, current.vWarm) }
-    }
-
-    fun testRoot() {
-        note("Verificando acesso root…", ToastKind.INFO)
-        safeLaunch {
-            val status = runCatching { adb.checkRoot(force = true) }.getOrNull()
-            if (status == null) {
-                note("Falha ao verificar root: sem resposta", ToastKind.ERROR)
-                toast("Falha ao verificar root.", ToastKind.ERROR)
-                return@safeLaunch
-            }
-            val message = if (status.available == true) {
-                "Root disponível · ${status.detail.ifBlank { "uid=0" }}"
-            } else {
-                "Sem root · ${status.detail.ifBlank { "indisponível" }}"
-            }
-            val kind = if (status.available == true) ToastKind.OK else ToastKind.ERROR
-            note(message, kind)
-            toast(message, kind)
-            _ui.update { it.copy(rootStatus = status) }
-            if (status.available == true) {
-                val current = prefsFlow.value
-                runCatching { applyVideoFixInternal(disable = current.rootFixVideo) }
-                runCatching { services.applyVirtualBrightness(current.vBright, current.vWarm) }
-            }
+        if (current.rootFixVideo) {
+            runCatching { applyVideoFixInternal(disable = true) }
+        }
+        if (current.vBright < 100 || current.vWarm > 0) {
+            runCatching { services.applyVirtualBrightness(current.vBright, current.vWarm) }
         }
     }
 
@@ -828,10 +800,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             prefsStore.update { it.copy(rootFixVideo = enabled) }
             _ui.update { it.copy(prefs = it.prefs.copy(rootFixVideo = enabled)) }
             if (!adb.online.value) return@safeLaunch
-            val result = runCatching { applyVideoFixInternal(disable = enabled) }
-            val failure = result.exceptionOrNull()
-            val ok = result.isSuccess && result.getOrNull()?.isSuccess == true
-            if (ok) {
+            val applied = runCatching { applyVideoFixInternal(disable = enabled) }.getOrNull()?.isSuccess == true
+            if (applied) {
                 val message = if (enabled) {
                     "Vídeo corrigido (1008=1 + decoder SW)."
                 } else {
@@ -841,10 +811,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 prefsStore.update { it.copy(rootFixVideo = previous) }
                 _ui.update { it.copy(prefs = it.prefs.copy(rootFixVideo = previous)) }
-                val detail = failure?.message?.ifBlank { null }
-                    ?: result.getOrNull()?.exceptionOrNull()?.message?.ifBlank { null }
-                    ?: "sem resposta"
-                val message = "Root necessário para ${if (enabled) "corrigir" else "restaurar"} o vídeo: ${trunc(detail, 120)}"
+                val message = "Root necessário para ${if (enabled) "corrigir" else "restaurar"} o vídeo."
                 noteAndToast(message, ToastKind.ERROR)
             }
         }
@@ -859,11 +826,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (!enabled) {
             stopMirror()
-            toast("Espelho desativado.", ToastKind.INFO)
+            scrcpy.resetTier()
         } else {
             mirrorRetryAfterMs = 0L
             safeLaunch { ensureMirrorInternal() }
-            toast("Espelho ativado.", ToastKind.INFO)
         }
     }
 
@@ -874,81 +840,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun setEncoder(encoder: String) {
-        safeLaunch {
-            prefsStore.update { it.copy(videoEncoder = encoder) }
-            _ui.update { it.copy(prefs = it.prefs.copy(videoEncoder = encoder)) }
-        }
-        val label = encoderLabel(encoder)
-        val restart = adb.online.value && _ui.value.mirrorState == MirrorState.ON
-        toast(
-            "Encoder: $label${if (restart) " · reiniciando espelho…" else " · aplicado ao próximo espelho"}",
-            ToastKind.INFO,
-        )
-        if (restart) startMirror()
-    }
-
-    fun setFpsMode(mode: String) {
-        if (mode !in setOf("auto", "60", "30", "15")) return
-        safeLaunch {
-            prefsStore.update { it.copy(fpsMode = mode) }
-            _ui.update { it.copy(prefs = it.prefs.copy(fpsMode = mode)) }
-        }
-        toast("FPS do espelho: ${if (mode == "auto") "Dinâmico" else mode}", ToastKind.INFO)
-        if (_ui.value.mirrorState == MirrorState.ON && _ui.value.serverFps != fpsServerValue(mode)) {
-            startMirror()
-        }
-    }
-
-    fun setResolution(mode: String) {
-        if (mode !in setOf("nativa", "720", "480")) return
-        safeLaunch {
-            prefsStore.update { it.copy(resMode = mode) }
-            _ui.update { it.copy(prefs = it.prefs.copy(resMode = mode)) }
-        }
-        toast("Resolução do espelho: ${mode.replaceFirstChar { it.uppercaseChar() }}", ToastKind.INFO)
-        if (_ui.value.mirrorState == MirrorState.ON) startMirror()
-    }
-
-    fun setHwAccel(enabled: Boolean) {
-        safeLaunch {
-            prefsStore.update { it.copy(hwaccel = enabled) }
-            _ui.update { it.copy(prefs = it.prefs.copy(hwaccel = enabled)) }
-        }
-        val verb = if (enabled) "ativada" else "desativada"
-        if (_ui.value.mirrorState == MirrorState.ON) {
-            toast("Aceleração por hardware $verb · reiniciando espelho…", ToastKind.INFO)
-            startMirror()
-        } else {
-            toast("Aceleração por hardware $verb.", ToastKind.INFO)
-        }
-    }
-
-    fun refreshEncoders() {
-        safeLaunch { refreshEncodersInternal(force = true, announce = true) }
-    }
-
-    private suspend fun refreshEncodersInternal(force: Boolean, announce: Boolean) {
-        if (!adb.online.value) return
-        if (announce) note("Procurando encoders H.264 no projetor…", ToastKind.INFO)
-        val found = runCatching { services.listAvcEncoders(force) }.getOrDefault(emptyList())
-        val defaults = listOf("auto", "hardware (padrão)", "c2.android.avc.encoder", "OMX.google.h264.encoder")
-        val merged = (defaults + found.map { it.trim() }.filter { it.isNotEmpty() }).distinct()
-        _ui.update { it.copy(encoders = merged) }
-        if (announce) {
-            val message = "${merged.size} opção(ões) de encoder."
-            note(message, ToastKind.OK)
-            toast(message, ToastKind.INFO)
-        }
-    }
-
     fun installLive() {
         if (!installingGuard.compareAndSet(false, true)) {
-            note("Já está baixando…", ToastKind.INFO)
+            note("Já está preparando…", ToastKind.INFO)
             return
         }
         _ui.update { it.copy(installing = true) }
-        note("Iniciando download…", ToastKind.INFO)
+        note("Preparando servidor integrado…", ToastKind.INFO)
         safeLaunch {
             val ok = runCatching {
                 val name = "scrcpy-server.jar"
@@ -969,9 +867,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 note("Pronto: servidor scrcpy disponível.", ToastKind.OK)
                 toast("Transmissão ao vivo pronta.", ToastKind.OK)
                 mirrorRetryAfterMs = 0L
+                safeLaunch { ensureMirrorInternal() }
             } else {
                 note("Falhou: servidor scrcpy não encontrado no pacote.", ToastKind.ERROR)
-                toast("Falha ao baixar a transmissão.", ToastKind.ERROR)
+                toast("Falha ao preparar a transmissão.", ToastKind.ERROR)
             }
         }
     }
@@ -981,14 +880,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun refreshSettingsInternal() {
-        val info = runCatching { services.systemInfo() }.getOrNull()
-        _ui.update {
-            it.copy(systemInfo = info?.takeIf { value -> value.isNotBlank() } ?: "Sem dados (projetor desconectado?)")
-        }
         runCatching { adb.cachedRootStatus() }.getOrNull()?.let { cached ->
             _ui.update { it.copy(rootStatus = cached) }
         }
-        refreshEncodersInternal(force = false, announce = false)
+        refreshDeviceInfoInternal()
         refreshPicture()
     }
 
@@ -1040,10 +935,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     havePq -> toast("Imagem apagada por brilho/contraste (espelho scrcpy inativo).", ToastKind.OK)
                     else -> {
                         _ui.update { it.copy(blackout = false) }
-                        toast(
-                            "Não deu para apagar: espelho scrcpy inativo e tools/tvctl.dex não encontrado.",
-                            ToastKind.ERROR,
-                        )
+                        toast("Não foi possível apagar a tela.", ToastKind.ERROR)
                     }
                 }
                 refreshScreenshot()
@@ -1059,7 +951,56 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // ---------------------------------------------------------------- perf --
+
+    fun refreshPerf() {
+        if (!adb.online.value) return
+        safeLaunch {
+            refreshDeviceInfoInternal()
+            refreshPerfInternal()
+        }
+    }
+
+    private suspend fun refreshDeviceInfoInternal() {
+        if (!adb.online.value || !deviceBusy.compareAndSet(false, true)) return
+        try {
+            val info = runCatching { services.deviceFullInfo() }.getOrNull() ?: return
+            _ui.update { it.copy(deviceInfo = info) }
+        } finally {
+            deviceBusy.set(false)
+        }
+    }
+
+    private suspend fun refreshPerfInternal() {
+        if (!adb.online.value || !perfBusy.compareAndSet(false, true)) return
+        try {
+            val stats = runCatching { services.devicePerfStats() }.getOrNull() ?: return
+            _ui.update { state ->
+                state.copy(
+                    perf = stats,
+                    cpuHistory = (state.cpuHistory + stats.cpuPct).takeLast(40),
+                    ramHistory = (state.ramHistory + stats.ramPct).takeLast(40),
+                )
+            }
+        } finally {
+            perfBusy.set(false)
+        }
+    }
+
+    private fun Float.roundToIntCompat(): Int = if (isNaN()) 0 else Math.round(this)
+
     // ---------------------------------------------------------------- apps --
+
+    fun appsShown() {
+        if (!_ui.value.appsLoaded) {
+            loadApps()
+        } else {
+            safeLaunch {
+                refreshProcessesInternal()
+                fetchAppMetadata()
+            }
+        }
+    }
 
     private fun applyRunningFlags(processes: List<ProcessInfo>) {
         val names = processes.map { it.name.substringBefore(':') }.toSet()
@@ -1080,6 +1021,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             toast("Projetor desconectado.", ToastKind.ERROR)
             return
         }
+        metaGeneration++
         safeLaunch {
             val apps = runCatching { services.listLaunchableApps() }.getOrNull()
             if (apps == null) {
@@ -1088,6 +1030,52 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             _ui.update { it.copy(apps = apps, appsLoaded = true) }
             refreshProcessesInternal()
+            fetchAppMetadata()
+        }
+    }
+
+    private suspend fun fetchAppMetadata() {
+        if (!adb.online.value || !appMetaBusy.compareAndSet(false, true)) return
+        val generation = ++metaGeneration
+        try {
+            val state = _ui.value
+            val pending = state.apps
+                .filterNot { metaCache.containsKey(it.packageName) }
+                .sortedWith(
+                    compareBy<AppInfo>(
+                        { !(it.running || it.packageName in state.favorites) },
+                        { !(it.running && it.packageName in state.favorites) },
+                        { !it.running },
+                        { it.packageName !in state.favorites },
+                        { it.title.lowercase(Locale.ROOT) },
+                    ),
+                )
+                .map { it.packageName }
+            for (pkg in pending) {
+                if (generation != metaGeneration || !adb.online.value) break
+                val meta = runCatching { services.extractAppMeta(pkg) }
+                    .getOrDefault(AppMeta(null, null))
+                metaCache[pkg] = meta
+                val icon = meta.iconBytes?.let { bytes ->
+                    withContext(Dispatchers.IO) {
+                        runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }.getOrNull()
+                    }
+                }
+                _ui.update { current ->
+                    current.copy(
+                        apps = current.apps.map { app ->
+                            if (app.packageName != pkg) app
+                            else app.copy(
+                                title = meta.label?.takeIf { it.isNotBlank() } ?: app.title,
+                                icon = icon ?: app.icon,
+                            )
+                        },
+                    )
+                }
+                yield()
+            }
+        } finally {
+            appMetaBusy.set(false)
         }
     }
 
@@ -1463,10 +1451,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         terminalIndex = -1
         _ui.update { it.copy(terminalDraft = "", terminalBusy = true) }
 
+        if (raw.equals("cls", ignoreCase = true) || raw.equals("clear", ignoreCase = true)) {
+            clearTerminal()
+            _ui.update { it.copy(terminalBusy = false) }
+            return
+        }
+
         val hostCommand = raw.startsWith("!")
         val body = if (hostCommand) raw.drop(1).trim() else raw
         if (hostCommand) {
-            appendTerminal("${'$'} !" + if (body.isEmpty()) "" else " $body", TerminalKind.COMMAND)
             appendTerminal("! comandos do PC não são suportados no Android.", TerminalKind.ERROR)
             _ui.update { it.copy(terminalBusy = false) }
             return
@@ -1480,7 +1473,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        safeLaunch {
+        terminalJob = safeLaunchJob {
             try {
                 for (line in lines) {
                     appendTerminal("${'$'} $line", TerminalKind.COMMAND)
@@ -1490,6 +1483,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     val result = try {
                         adb.shell(line, 120_000L)
+                    } catch (t: CancellationException) {
+                        throw t
                     } catch (t: Throwable) {
                         appendTerminal(trunc(t.message ?: "Falha no comando.", 200), TerminalKind.ERROR)
                         break
@@ -1505,9 +1500,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     if (!result.ok) appendTerminal("[exit ${result.exitCode}]", TerminalKind.ERROR)
                 }
             } finally {
+                terminalJob = null
                 _ui.update { it.copy(terminalBusy = false) }
             }
         }
+    }
+
+    fun cancelTerminal() {
+        if (!_ui.value.terminalBusy) return
+        terminalJob?.cancel()
+        terminalJob = null
+        appendTerminal("^C", TerminalKind.SUB)
+        _ui.update { it.copy(terminalBusy = false, terminalDraft = "") }
     }
 
     fun clearTerminal() {

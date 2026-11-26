@@ -69,13 +69,12 @@ fun FilesScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
     var textDraft by remember { mutableStateOf("") }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             GlassCard(
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.fillMaxWidth(),
                 corner = 16.dp,
                 contentPadding = PaddingValues(0.dp),
             ) {
@@ -83,6 +82,7 @@ fun FilesScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                     value = pathDraft,
                     onValueChange = { pathDraft = it },
                     singleLine = true,
+                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 13.sp),
                     colors = TextFieldDefaults.colors(
                         focusedContainerColor = GlassColors.glassHi,
                         unfocusedContainerColor = GlassColors.glassHi,
@@ -94,9 +94,14 @@ fun FilesScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                     ),
                 )
             }
-            GlassButton("Ir", { viewModel.setFilesPath(pathDraft) }, compact = true)
-            GlassButton("⬆", { viewModel.filesParent() }, compact = true)
-            GlassButton("↻", { viewModel.reloadFiles() }, compact = true)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                GlassButton("Ir", { viewModel.setFilesPath(pathDraft) }, modifier = Modifier.weight(1f), compact = true)
+                GlassButton("⬆ Acima", { viewModel.filesParent() }, modifier = Modifier.weight(1f), compact = true)
+                GlassButton("↻ Atualizar", { viewModel.reloadFiles() }, modifier = Modifier.weight(1f), compact = true)
+            }
         }
 
         if (state.files.isEmpty()) {
@@ -122,7 +127,7 @@ fun FilesScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             GlassButton(
-                "Enviar arquivo",
+                "Enviar",
                 { uploadLauncher.launch("*/*") },
                 modifier = Modifier.weight(1f),
                 selected = true,
@@ -153,7 +158,7 @@ fun FilesScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
             onDismiss = { sheetEntry = null },
         ) {
             GlassButton(
-                "Baixar para o PC",
+                "Baixar para o celular",
                 onClick = {
                     downloadTarget = entry
                     runCatching { downloadLauncher.launch(entry.name) }

@@ -1,6 +1,5 @@
 package com.radba.remoto.util
 
-import com.radba.remoto.data.Prefs
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -73,56 +72,29 @@ fun splitHost(input: String): Pair<String, Int> {
     return input.substring(0, idx) to port
 }
 
-fun fpsServerValue(mode: String): Int = when (mode) {
-    "60" -> 60
-    "30" -> 30
-    "15" -> 15
-    else -> 60
-}
+/** Perfis adaptativos portados da versão 0.2 do RADB. */
+data class VideoTier(
+    val name: String,
+    val maxSize: Int,
+    val maxFps: Int,
+    val bitrate: Int,
+    val outMaxWidth: Int,
+    val outMaxHeight: Int,
+)
 
-fun uiFrameDelayMs(mode: String): Int = when (mode) {
-    "60" -> 16
-    "30" -> 33
-    "15" -> 66
-    else -> 16
-}
+val VIDEO_TIERS: List<VideoTier> = listOf(
+    VideoTier("60 FPS Fluido", 960, 60, 3_500_000, 960, 540),
+    VideoTier("60 FPS Eco", 854, 60, 2_400_000, 854, 480),
+    VideoTier("45 FPS Rede", 768, 45, 1_800_000, 768, 432),
+    VideoTier("30 FPS Estável", 640, 30, 1_200_000, 640, 360),
+)
 
-data class ResolutionProfile(val maxSize: Int, val bitrate: Int, val outMaxWidth: Int, val outMaxHeight: Int)
-
-fun resolutionProfile(mode: String): ResolutionProfile = when (mode) {
-    "nativa" -> ResolutionProfile(0, 8_000_000, 1920, 1080)
-    "480" -> ResolutionProfile(854, 2_500_000, 854, 480)
-    else -> ResolutionProfile(1280, 5_000_000, 1280, 720)
-}
-
-fun encoderPlan(prefs: Prefs): List<Pair<String?, Boolean>> {
-    val pref = prefs.videoEncoder.trim()
-    if (pref.equals("hardware (padrão)", ignoreCase = true) ||
-        pref.equals("hardware", ignoreCase = true) ||
-        pref.equals("padrao", ignoreCase = true)
-    ) return listOf(null to false)
-    if (pref.isNotEmpty() && pref != "auto") {
-        val soft = pref.startsWith("c2.") || pref.startsWith("OMX.google.")
-        if (pref.startsWith("c2.")) {
-            return listOf(pref to true, "OMX.google.h264.encoder" to true, null to false)
-        }
-        return listOf(pref to soft)
-    }
-    if (prefs.rootFixVideo) {
-        return listOf(
-            "c2.android.avc.encoder" to true,
-            "OMX.google.h264.encoder" to true,
-            null to false,
-        )
-    }
-    return listOf(null to false)
-}
-
-fun encoderLabel(encoder: String): String = when {
-    encoder == "auto" -> "Auto (software com root)"
-    encoder.equals("hardware (padrão)", ignoreCase = true) -> "Hardware (padrão)"
-    else -> encoder
-}
+/** The new version always tries the default encoder first, then software fallbacks. */
+fun encoderPlan(): List<Pair<String?, Boolean>> = listOf(
+    null to false,
+    "c2.android.avc.encoder" to true,
+    "OMX.google.h264.encoder" to true,
+)
 
 fun palette(key: String): Long {
     val colors = longArrayOf(

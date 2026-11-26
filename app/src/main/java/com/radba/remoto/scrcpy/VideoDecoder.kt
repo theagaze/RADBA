@@ -2,6 +2,7 @@ package com.radba.remoto.scrcpy
 
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.os.SystemClock
 import android.view.Surface
 import kotlinx.coroutines.flow.MutableStateFlow
 import java.io.Closeable
@@ -51,7 +52,14 @@ class VideoDecoder : Closeable {
     @Volatile
     private var mimeType: String = MediaFormat.MIMETYPE_VIDEO_AVC
 
+    @Volatile
+    private var lastFedAtMs = 0L
+
+    @Volatile
+    private var lastRenderedAtMs = 0L
+
     private val packets = ArrayDeque<EncodedPacket>()
+    private val frameTimes = ArrayDeque<Long>()
 
     /** Last SPS/PPS access unit, replayed whenever the codec is recreated. */
     @Volatile
@@ -95,6 +103,7 @@ class VideoDecoder : Closeable {
     /** Queue one encoded access unit. [flags] use MediaCodec.BUFFER_FLAG_*. */
     fun feed(data: ByteArray, flags: Int, ptsUs: Long) {
         if (closed) return
+        lastFedAtMs = SystemClock.elapsedRealtime()
         val isConfig = flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
         val isKey = flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
         if (expectKeyFrame && !isConfig && !isKey) return
@@ -107,6 +116,26 @@ class VideoDecoder : Closeable {
             packets.addLast(EncodedPacket(data.copyOf(), flags, ptsUs))
             (lock as java.lang.Object).notifyAll()
         }
+    }
+
+    /** Rendered frames in the last [windowMs], used by the adaptive video tiers. */
+    fun fps(windowMs: Long = 1_500L): Float {
+        val now = SystemClock.elapsedRealtime()
+        synchronized(frameTimes) {
+            while (frameTimes.isNotEmpty() && now - frameTimes.first() > windowMs) {
+                frameTimes.removeFirst()
+            }
+            return frameTimes.size * 1_000f / windowMs.toFloat()
+        }
+    }
+
+    fun lastRenderedAt(): Long = lastRenderedAtMs
+
+    /** Approximate queue delay between the newest fed packet and rendered frame. */
+    fun lagMs(): Long {
+        val fed = lastFedAtMs
+        val rendered = lastRenderedAtMs
+        return if (fed > 0L && rendered >= fed) rendered - fed else 0L
     }
 
     /** Signal that no more encoded data will arrive. */
@@ -135,6 +164,7 @@ class VideoDecoder : Closeable {
         if (thread?.isAlive == true) return
         endOfStream = false
         configured.value = false
+        synchronized(frameTimes) { frameTimes.clear() }
         thread = Thread({ decodeLoop() }, "scrcpy-decoder").apply {
             isDaemon = true
             start()
@@ -297,7 +327,14 @@ class VideoDecoder : Closeable {
                         handleCodecFailure(t)
                         return reachedEos
                     }
-                    if (render && !firstFrame.value) firstFrame.value = true
+                    if (render) {
+                        lastRenderedAtMs = SystemClock.elapsedRealtime()
+                        synchronized(frameTimes) {
+                            frameTimes.addLast(lastRenderedAtMs)
+                            while (frameTimes.size > 120) frameTimes.removeFirst()
+                        }
+                        if (!firstFrame.value) firstFrame.value = true
+                    }
                     if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) reachedEos = true
                 }
             }

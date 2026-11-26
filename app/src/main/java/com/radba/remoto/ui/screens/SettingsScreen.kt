@@ -1,6 +1,5 @@
 package com.radba.remoto.ui.screens
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -24,6 +23,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -37,8 +37,6 @@ import com.radba.remoto.ui.components.GlassSheet
 import com.radba.remoto.ui.components.GlassSlider
 import com.radba.remoto.ui.components.GlassToggle
 import com.radba.remoto.ui.theme.GlassColors
-import com.radba.remoto.util.resolutionProfile
-import com.radba.remoto.util.uiFrameDelayMs
 
 @Composable
 fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
@@ -47,9 +45,8 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
     LaunchedEffect(prefs.host) { hostDraft = prefs.host }
 
     var pairDialog by remember { mutableStateOf(false) }
-    var pairAddress by remember { mutableStateOf("") }
+    var pairAddress by remember { mutableStateOf(prefs.host.substringBefore(":") + ":") }
     var pairCode by remember { mutableStateOf("") }
-    var encoderDialog by remember { mutableStateOf(false) }
     var processesSheet by remember { mutableStateOf(false) }
 
     Column(
@@ -61,32 +58,43 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
     ) {
         GlassCard {
             Text(text = "Conexão", color = GlassColors.text, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-            Row(
+            GlassCard(
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                corner = 14.dp,
+                contentPadding = PaddingValues(0.dp),
+            ) {
+                TextField(
+                    value = hostDraft,
+                    onValueChange = { hostDraft = it },
+                    singleLine = true,
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = GlassColors.glassHi,
+                        unfocusedContainerColor = GlassColors.glassHi,
+                        focusedTextColor = GlassColors.text,
+                        unfocusedTextColor = GlassColors.text,
+                        cursorColor = GlassColors.acc,
+                        focusedIndicatorColor = GlassColors.acc,
+                        unfocusedIndicatorColor = Color.Transparent,
+                    ),
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                GlassCard(
+                GlassButton(
+                    "Salvar",
+                    onClick = { viewModel.setHost(hostDraft) },
                     modifier = Modifier.weight(1f),
-                    corner = 14.dp,
-                    contentPadding = PaddingValues(0.dp),
-                ) {
-                    TextField(
-                        value = hostDraft,
-                        onValueChange = { hostDraft = it },
-                        singleLine = true,
-                        colors = TextFieldDefaults.colors(
-                            focusedContainerColor = GlassColors.glassHi,
-                            unfocusedContainerColor = GlassColors.glassHi,
-                            focusedTextColor = GlassColors.text,
-                            unfocusedTextColor = GlassColors.text,
-                            cursorColor = GlassColors.acc,
-                            focusedIndicatorColor = GlassColors.acc,
-                            unfocusedIndicatorColor = Color.Transparent,
-                        ),
-                    )
-                }
-                GlassButton("Salvar", { viewModel.setHost(hostDraft) }, compact = true, selected = true)
-                GlassButton("Reconectar", { viewModel.reconnect() }, compact = true)
+                    selected = true,
+                    compact = true,
+                )
+                GlassButton(
+                    "Reconectar",
+                    onClick = { viewModel.reconnect() },
+                    modifier = Modifier.weight(1f),
+                    compact = true,
+                )
             }
             Text(
                 text = "Conexão: ${state.connectionText}",
@@ -114,7 +122,7 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 GlassButton(
                     "Parear (Android 11+)",
                     onClick = {
-                        pairAddress = ""
+                        pairAddress = prefs.host.substringBefore(":") + ":"
                         pairCode = ""
                         pairDialog = true
                     },
@@ -132,7 +140,7 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
 
         GlassCard {
             Text(
-                text = "Transmissão ao vivo (scrcpy)",
+                text = "Transmissão melhorada (scrcpy)",
                 color = GlassColors.text,
                 fontSize = 17.sp,
                 fontWeight = FontWeight.Bold,
@@ -140,45 +148,41 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
             GlassToggle(
                 checked = prefs.mirror,
                 onCheckedChange = { viewModel.setMirrorEnabled(it) },
-                label = "Usar espelho fluido",
+                label = "Transmissão melhorada (ao vivo)",
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             )
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
-                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                Text(text = "Encoder do vídeo (H.264)", color = GlassColors.text, fontSize = 13.sp, modifier = Modifier.weight(1f))
-                GlassButton(
-                    label = if (prefs.videoEncoder == "auto") "Auto (SW c/ root)" else prefs.videoEncoder,
-                    onClick = { encoderDialog = true },
-                    compact = true,
-                )
-            }
-            val encoderExplanation = if (state.activeEncoder.isNotBlank()) {
-                "Encoder ativo no espelho: ${state.activeEncoder}"
-            } else {
-                "Software limita a 960p/24fps para não engasgar a CPU do projetor."
-            }
-            Text(text = encoderExplanation, color = GlassColors.sub, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
             Text(
-                text = "Instale a transmissão ao vivo para usar o espelho fluido.",
+                text = "Quando ativada e os complementos estiverem instalados, permanece 100% no scrcpy " +
+                    "(30–60 FPS automático conforme a rede). Ao desativar, usa captura periódica.",
                 color = GlassColors.sub,
                 fontSize = 11.sp,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+            Text(
+                text = "Perfil ativo: ${state.mirrorTier} · ${state.mirrorFps} FPS · ${state.mirrorLatencyMs}ms",
+                color = GlassColors.acc,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+            Text(
+                text = "scrcpy v2.7 integrado · perfil automático 30–60 FPS",
+                color = GlassColors.sub,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 4.dp),
             )
             Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 GlassButton(
-                    "Baixar transmissão ao vivo",
+                    "Baixar transmissão melhorada (opcional)",
                     onClick = { viewModel.installLive() },
                     modifier = Modifier.weight(1f),
                     selected = true,
                     compact = true,
                 )
                 GlassButton(
-                    "Testar espelho",
+                    "Reiniciar scrcpy",
                     onClick = {
                         runCatching {
                             viewModel.stopMirror()
@@ -189,59 +193,17 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                     compact = true,
                 )
             }
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                Text(text = "FPS do espelho", color = GlassColors.text, fontSize = 13.sp, modifier = Modifier.weight(1f))
-                for ((label, mode) in listOf("Dinâmico" to "auto", "60" to "60", "30" to "30", "15" to "15")) {
-                    GlassButton(
-                        label,
-                        onClick = { viewModel.setFpsMode(mode) },
-                        modifier = Modifier.weight(0.7f),
-                        selected = prefs.fpsMode == mode,
-                        compact = true,
-                    )
-                }
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                Text(text = "Resolução", color = GlassColors.text, fontSize = 13.sp, modifier = Modifier.weight(1f))
-                for ((label, mode) in listOf("Nativa" to "nativa", "720p" to "720", "480p" to "480")) {
-                    GlassButton(
-                        label,
-                        onClick = { viewModel.setResolution(mode) },
-                        modifier = Modifier.weight(0.8f),
-                        selected = prefs.resMode == mode,
-                        compact = true,
-                    )
-                }
-            }
-            GlassToggle(
-                checked = prefs.hwaccel,
-                onCheckedChange = { viewModel.setHwAccel(it) },
-                label = "Decodificação por hardware (d3d11va)",
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-            )
-            val profile = resolutionProfile(prefs.resMode)
-            val maxSize = if (profile.maxSize == 0) "nativa" else profile.maxSize.toString()
-            val ui = if (prefs.fpsMode == "auto") "dinâmica" else "${uiFrameDelayMs(prefs.fpsMode)} ms"
-            Text(
-                text = "FPS servidor: ${state.serverFps} · Resolução máx.: ${maxSize}px · " +
-                    "bitrate ${profile.bitrate / 1000} kbps · UI: $ui",
-                color = GlassColors.sub,
-                fontSize = 11.sp,
-                modifier = Modifier.padding(top = 6.dp),
-            )
         }
 
         GlassCard {
-            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                Text(text = "Root", color = GlassColors.text, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "Root",
+                    color = GlassColors.text,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f),
+                )
                 val root = state.rootStatus
                 val rootLabel = when (root.available) {
                     null -> "não verificado"
@@ -253,19 +215,22 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                     false -> GlassColors.bad
                     null -> GlassColors.sub
                 }
-                Text(text = rootLabel, color = rootColor, fontSize = 11.sp, modifier = Modifier.weight(1.4f))
-                GlassButton("Testar Root", { viewModel.testRoot() }, compact = true)
+                Text(
+                    text = rootLabel,
+                    color = rootColor,
+                    fontSize = 11.sp,
+                    modifier = Modifier.weight(1.4f),
+                )
             }
             GlassToggle(
                 checked = prefs.rootFixVideo,
                 onCheckedChange = { viewModel.setRootFix(it) },
-                label = "Corrigir vídeo com Root (Desativar HW Overlays)",
+                label = "Corrigir vídeo verde no espelho (Root)",
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             )
             Text(
-                text = "Aplica SurfaceFlinger 1008 i32 1 e força decodificação de vídeo em software " +
-                    "(c2.android.* via vendor.media.c2.vdec.support=false) ao conectar e iniciar o espelho: " +
-                    "evita blocos verdes/roxos em YouTube, Galeria, BrFlix e outros apps no HY320.",
+                text = "Aplica SurfaceFlinger 1008 i32 1 e força decodificação em software " +
+                    "(vendor.media.c2.vdec.support=false) sem alterar arquivos do sistema.",
                 color = GlassColors.sub,
                 fontSize = 11.sp,
                 modifier = Modifier.padding(top = 6.dp),
@@ -273,7 +238,16 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
         }
 
         GlassCard {
-            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+            Text(
+                text = "Brilho virtual",
+                color = GlassColors.text,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Bold,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 Text(text = "☀ Brilho virtual", color = GlassColors.text, fontSize = 13.sp, modifier = Modifier.weight(1f))
                 Text(text = "${state.brightnessPct}%", color = GlassColors.text, fontSize = 12.sp, fontWeight = FontWeight.Bold)
             }
@@ -284,7 +258,7 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
                 valueRange = 10f..100f,
                 accent = GlassColors.warn,
             )
-            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = "☾ Filtro quente / conforto noturno",
                     color = GlassColors.text,
@@ -320,7 +294,7 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
             }
             Text(
                 text = "Usa SurfaceFlinger 1015 (matriz de cor) + 1008 (desativa HW Overlays) via root. " +
-                    "Escurece também YouTube/Galeria/BrFlix. Mínimo seguro: 10%.",
+                    "Mínimo seguro: 10%.",
                 color = GlassColors.sub,
                 fontSize = 11.sp,
                 modifier = Modifier.padding(top = 6.dp),
@@ -328,22 +302,45 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
         }
 
         GlassCard {
+            Text(text = "Entrada e Teclado", color = GlassColors.text, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+            GlassToggle(
+                checked = prefs.kb,
+                onCheckedChange = { viewModel.setKeyboardEnabled(it) },
+                label = "Teclado do PC controla o projetor na tela Início",
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            )
+        }
+
+        GlassCard {
             Text(text = "Sistema e controles", color = GlassColors.text, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-            Text(text = state.systemInfo, color = GlassColors.text, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+            Text(
+                text = "Use a aba Desempenho para cpu, RAM, armazenamento e ficha técnica.",
+                color = GlassColors.sub,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 6.dp),
+            )
             Row(
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                GlassButton("Processos", { processesSheet = true }, modifier = Modifier.weight(1f), compact = true)
-                GlassButton("Acordar tela", { viewModel.wakeScreen() }, modifier = Modifier.weight(1f), compact = true, selected = true)
+                GlassButton(
+                    "Processos",
+                    onClick = {
+                        viewModel.refreshProcesses()
+                        processesSheet = true
+                    },
+                    modifier = Modifier.weight(1f),
+                    compact = true,
+                )
+                GlassButton(
+                    "Acordar tela",
+                    { viewModel.wakeScreen() },
+                    modifier = Modifier.weight(1f),
+                    compact = true,
+                    selected = true,
+                )
                 GlassButton("Atualizar info", { viewModel.refreshSettings() }, modifier = Modifier.weight(1f), compact = true)
             }
-            GlassToggle(
-                checked = prefs.kb,
-                onCheckedChange = { viewModel.setKeyboardEnabled(it) },
-                label = "Teclado do PC controla o projetor",
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-            )
         }
     }
 
@@ -377,35 +374,6 @@ fun SettingsScreen(viewModel: MainViewModel, state: MainViewModel.UiState) {
             },
             dismissButton = {
                 TextButton(onClick = { pairDialog = false }) { Text(text = "Cancelar", color = GlassColors.sub) }
-            },
-        )
-    }
-
-    if (encoderDialog) {
-        AlertDialog(
-            onDismissRequest = { encoderDialog = false },
-            title = { Text(text = "Encoder do vídeo (H.264)", color = GlassColors.text) },
-            text = {
-                Column {
-                    for (encoder in state.encoders) {
-                        val label = if (encoder == "auto") "Auto (SW c/ root)" else encoder
-                        Text(
-                            text = label,
-                            color = if (encoder == prefs.videoEncoder) GlassColors.acc else GlassColors.text,
-                            fontSize = 14.sp,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    viewModel.setEncoder(encoder)
-                                    encoderDialog = false
-                                }
-                                .padding(vertical = 10.dp),
-                        )
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { encoderDialog = false }) { Text(text = "Fechar", color = GlassColors.sub) }
             },
         )
     }

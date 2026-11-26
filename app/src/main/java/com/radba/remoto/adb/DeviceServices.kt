@@ -1,9 +1,12 @@
 package com.radba.remoto.adb
 
 import com.radba.remoto.data.AppInfo
+import com.radba.remoto.data.AppMeta
+import com.radba.remoto.data.DeviceInfo
 import com.radba.remoto.data.FileEntry
-import com.radba.remoto.data.MediaInfo
+import com.radba.remoto.data.PerfStats
 import com.radba.remoto.data.ProcessInfo
+import com.radba.remoto.data.StorageStats
 import com.radba.remoto.data.VolumeInfo
 import com.radba.remoto.util.appTitle
 import com.radba.remoto.util.clampInt
@@ -12,15 +15,17 @@ import com.radba.remoto.util.shellQuote
 import com.radba.remoto.util.shellStripExitCode
 import com.radba.remoto.util.trunc
 import kotlinx.coroutines.delay
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
+import java.util.zip.GZIPInputStream
+import kotlin.math.max
 
 /** Device-level operations built on top of ADB shell commands. */
 class DeviceServices(private val adb: AdbManager) {
-    private var encoderCacheHost: String? = null
-    private var encoderCache: List<String>? = null
+    private var previousCpu: Pair<Long, Long>? = null
 
     suspend fun getVolume(): VolumeInfo? {
         val result = adb.shell("cmd media_session volume --stream 3 --get", 20_000)
@@ -116,6 +121,13 @@ class DeviceServices(private val adb: AdbManager) {
             val pid = parts[0].toIntOrNull() ?: continue
             val name = parts.last()
             if (name == "NAME" || name == "CMD" || name.startsWith("[")) continue
+            if (name.startsWith("android", ignoreCase = true) ||
+                name.startsWith("com.android", ignoreCase = true) ||
+                name.startsWith("system", ignoreCase = true) ||
+                name.startsWith("zygote", ignoreCase = true)
+            ) {
+                continue
+            }
             processes.add(ProcessInfo(pid, name))
         }
         return processes.sortedBy { it.pid }
@@ -142,20 +154,188 @@ class DeviceServices(private val adb: AdbManager) {
         return entries.sortedWith(compareBy<FileEntry> { !it.isDir }.thenBy { it.name.lowercase(Locale.ROOT) })
     }
 
-    suspend fun systemInfo(): String {
-        val result = adb.shell(
-            "getprop ro.product.model; getprop ro.build.version.release; df -h /sdcard | tail -n 1",
-            20_000,
+    suspend fun deviceFullInfo(): DeviceInfo {
+        val command = buildString {
+            append("echo MODEL=$(getprop ro.product.model);")
+            append("echo NAME=$(getprop ro.product.name);")
+            append("echo DEVICE=$(getprop ro.product.device);")
+            append("echo BRAND=$(getprop ro.product.brand);")
+            append("echo MANUF=$(getprop ro.product.manufacturer);")
+            append("echo ANDROID=$(getprop ro.build.version.release);")
+            append("echo SDK=$(getprop ro.build.version.sdk);")
+            append("echo BUILD=$(getprop ro.build.display.id);")
+            append("echo ABI=$(getprop ro.product.cpu.abi);")
+            append("echo KERNEL=$(uname -r);")
+            append("echo WMSIZE=$(wm size 2>/dev/null | tail -n 1);")
+            append("echo UPTIME=$(cat /proc/uptime 2>/dev/null);")
+            append("echo CORES=$(grep -c ^processor /proc/cpuinfo 2>/dev/null);")
+            append("echo DFDATA=$(df -k /data 2>/dev/null | tail -n 1);")
+            append("echo DFSD=$(df -k /sdcard 2>/dev/null | tail -n 1)")
+        }
+        val result = adb.shell(command, 15_000)
+        val values = HashMap<String, String>()
+        for (line in result.stdout.lineSequence()) {
+            val index = line.indexOf('=')
+            if (index < 0) continue
+            values[line.substring(0, index).trim()] = line.substring(index + 1).trim()
+        }
+        fun field(key: String): String = values[key]?.trim()?.takeIf { it.isNotEmpty() } ?: "?"
+        val rawWmSize = values["WMSIZE"].orEmpty().trim()
+        val cleanWmSize = rawWmSize.substringAfterLast(' ', rawWmSize).ifEmpty { "?" }
+        return DeviceInfo(
+            model = field("MODEL"),
+            name = field("NAME"),
+            device = field("DEVICE"),
+            brand = field("BRAND"),
+            manuf = field("MANUF"),
+            android = field("ANDROID"),
+            sdk = field("SDK"),
+            build = field("BUILD"),
+            abi = field("ABI"),
+            kernel = field("KERNEL"),
+            wmSize = cleanWmSize,
+            uptimeSeconds = values["UPTIME"]?.split(Regex("\\s+"))?.firstOrNull()
+                ?.toDoubleOrNull()?.toLong() ?: 0L,
+            cores = field("CORES"),
+            dataStorage = parseDfKb(values["DFDATA"].orEmpty()),
+            sdcardStorage = parseDfKb(values["DFSD"].orEmpty()),
         )
-        val lines = result.stdout.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
-        val model = lines.getOrNull(0)?.ifEmpty { "?" } ?: "?"
-        val android = lines.getOrNull(1)?.ifEmpty { "?" } ?: "?"
-        val storage = lines.getOrNull(2)?.let { line ->
-            val fields = line.split(Regex("\\s+")).filter { it.isNotEmpty() }
-            if (fields.size >= 4) "Armazenamento livre: ${fields[3]} de ${fields[1]}"
-            else "Armazenamento livre: $line"
-        } ?: "Armazenamento livre: ?"
-        return "Modelo: $model\nAndroid: $android\n$storage"
+    }
+
+    suspend fun devicePerfStats(): PerfStats? {
+        val command = buildString {
+            append("head -n 1 /proc/stat;")
+            append("echo __MEM__; cat /proc/meminfo;")
+            append("echo __LOAD__; cat /proc/loadavg 2>/dev/null;")
+            append("echo __TEMP__; cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null;")
+            append("echo __FREQ__; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null;")
+            append("echo __DF__; df -k /sdcard 2>/dev/null | tail -n 1")
+        }
+        val result = adb.shell(command, 12_000)
+        if (!result.ok && result.stdout.isEmpty()) return null
+
+        val (statPart, afterMem) = splitOnce(result.stdout, "__MEM__")
+        val (memPart, afterLoad) = splitOnce(afterMem, "__LOAD__")
+        val (loadPart, afterTemp) = splitOnce(afterLoad, "__TEMP__")
+        val (tempPart, afterFreq) = splitOnce(afterTemp, "__FREQ__")
+        val (freqPart, dfPart) = splitOnce(afterFreq, "__DF__")
+
+        var cpuPct = 0f
+        for (line in statPart.lineSequence()) {
+            if (!line.startsWith("cpu ")) continue
+            val numbers = line.split(Regex("\\s+")).drop(1).mapNotNull { it.toLongOrNull() }
+            if (numbers.size >= 4) {
+                val idle = numbers[3] + numbers.getOrElse(4) { 0L }
+                val total = numbers.sum()
+                val previous = previousCpu
+                previousCpu = total to idle
+                if (previous != null && total > previous.first) {
+                    val deltaTotal = total - previous.first
+                    val deltaIdle = idle - previous.second
+                    cpuPct = ((deltaTotal - deltaIdle) * 100f / deltaTotal).coerceIn(0f, 100f)
+                }
+            }
+            break
+        }
+
+        val memory = HashMap<String, Long>()
+        for (match in MEMORY_REGEX.findAll(memPart)) {
+            val key = match.groupValues[1]
+            val value = match.groupValues[2].toLongOrNull() ?: continue
+            memory[key] = value * 1024L
+        }
+        val ramTotal = memory["MemTotal"] ?: 0L
+        val ramAvailable = memory["MemAvailable"] ?: ((memory["MemFree"] ?: 0L) + (memory["Cached"] ?: 0L))
+        val ramUsed = max(0L, ramTotal - ramAvailable)
+        val ramPct = if (ramTotal > 0L) ramUsed * 100f / ramTotal else 0f
+        val swapTotal = memory["SwapTotal"] ?: 0L
+        val swapUsed = max(0L, swapTotal - (memory["SwapFree"] ?: 0L))
+
+        val tempC = tempPart.lineSequence().firstOrNull()?.trim()?.toFloatOrNull()?.let { raw ->
+            if (raw > 200f) raw / 1_000f else raw
+        }
+        val freqMhz = freqPart.lineSequence().firstOrNull()?.trim()?.toIntOrNull()?.div(1_000)
+        val load = loadPart.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }.take(3).joinToString(" ")
+        val storage = dfPart.lineSequence().lastOrNull { it.isNotBlank() }?.let { parseDfKb(it) }
+
+        return PerfStats(
+            cpuPct = cpuPct,
+            ramTotal = ramTotal,
+            ramUsed = ramUsed,
+            ramAvail = ramAvailable,
+            ramPct = ramPct,
+            swapTotal = swapTotal,
+            swapUsed = swapUsed,
+            tempC = tempC,
+            freqMhz = freqMhz,
+            load = load,
+            storage = storage,
+        )
+    }
+
+    suspend fun extractAppMeta(packageName: String): AppMeta {
+        val pathResult = adb.shell(
+            "pm path ${shellQuote(packageName)} | head -n 1 | cut -d: -f2",
+            10_000,
+        )
+        val apk = pathResult.stdout.trim()
+        if (apk.isEmpty()) return AppMeta(null, null)
+
+        val manifest = unzipGz(apk, "AndroidManifest.xml", 12_000) ?: return AppMeta(null, null)
+        val axml = ApkMetaParser.parseAppMeta(manifest)
+        var arsc: ByteArray? = null
+        val targetIds = buildSet {
+            axml.iconRes?.let { add(it) }
+            axml.labelRes?.let { add(it) }
+        }
+        val resolved = if (targetIds.isNotEmpty()) {
+            arsc = unzipGz(apk, "resources.arsc", 25_000)
+            arsc?.let { ApkMetaParser.parseArsc(it, targetIds) } ?: emptyMap()
+        } else {
+            emptyMap()
+        }
+
+        val label = axml.label ?: axml.labelRes?.let { resolved[it]?.firstOrNull() }
+        val candidates = axml.iconRes?.let { resolved[it].orEmpty() }.orEmpty()
+        val imagePaths = candidates.filterNot { it.endsWith(".xml", ignoreCase = true) }.toMutableList()
+
+        if (imagePaths.isEmpty() && candidates.isNotEmpty() && arsc != null) {
+            for (xmlPath in candidates) {
+                val xml = unzipGz(apk, xmlPath, 10_000) ?: continue
+                val foregroundId = ApkMetaParser.parseForeground(xml) ?: continue
+                val foregroundPaths = ApkMetaParser.parseArsc(arsc!!, setOf(foregroundId))[foregroundId].orEmpty()
+                imagePaths.addAll(foregroundPaths.filterNot { it.endsWith(".xml", ignoreCase = true) })
+                if (imagePaths.isNotEmpty()) break
+            }
+        }
+
+        for (path in imagePaths.asReversed()) {
+            val bytes = unzipGz(apk, path, 12_000) ?: continue
+            if (ApkMetaParser.isImage(bytes)) return AppMeta(label, bytes)
+        }
+        return AppMeta(label, null)
+    }
+
+    private suspend fun unzipGz(apk: String, entry: String, timeoutMs: Long): ByteArray? {
+        val command = "unzip -p ${shellQuote(apk)} ${shellQuote(entry)} 2>/dev/null | gzip -1"
+        val compressed = readStreamToBytes(adb, "exec-out:sh -c ${shellQuote(command)}", timeoutMs)
+            ?: return null
+        if (compressed.isEmpty()) return null
+        return try {
+            val output = ByteArrayOutputStream()
+            GZIPInputStream(compressed.inputStream()).use { gzip ->
+                val buffer = ByteArray(16 * 1024)
+                while (true) {
+                    val count = gzip.read(buffer)
+                    if (count < 0) break
+                    if (output.size() + count > MAX_UNZIP_BYTES) return null
+                    output.write(buffer, 0, count)
+                }
+            }
+            output.toByteArray()
+        } catch (_: IOException) {
+            null
+        }
     }
 
     suspend fun screenshot(): ByteArray? {
@@ -163,8 +343,6 @@ class DeviceServices(private val adb: AdbManager) {
         if (direct.isPng()) return direct
 
         val shellRaw = readStreamToBytes(adb, "shell:screencap -p", 25_000) ?: return null
-        // Some adbd builds translate LF to CRLF on `shell:`, which corrupts the
-        // PNG payload while leaving its magic bytes intact.
         val withoutExit = shellStripExitCode(normalizeCrLf(shellRaw)).data
         if (withoutExit.isPng()) return withoutExit
 
@@ -176,82 +354,6 @@ class DeviceServices(private val adb: AdbManager) {
             if (little > 0 && little == body.size && body.isPng()) return body
         }
         return null
-    }
-
-    suspend fun listAvcEncoders(force: Boolean = false): List<String> {
-        val currentHost = adb.host.value
-        if (!force && encoderCacheHost == currentHost && encoderCache != null) {
-            return encoderCache ?: emptyList()
-        }
-
-        val found = mutableListOf<String>()
-        val seen = mutableSetOf<String>()
-        fun add(name: String) {
-            val clean = name.trim().trim('\'', '"')
-            if (clean.isEmpty() || clean in seen) return
-            val lower = clean.lowercase(Locale.ROOT)
-            if (lower.contains("decod") || lower.endsWith(".dec")) return
-            seen.add(clean)
-            found.add(clean)
-        }
-
-        val scrcpy = adb.shell(
-            "CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / " +
-                "com.genymobile.scrcpy.Server 2.7 list_encoders=true",
-            12_000,
-        )
-        ENCODER_REGEX.findAll(scrcpy.stdout).forEach { add(it.groupValues[1]) }
-
-        if (found.isEmpty()) {
-            val codecs = adb.shell("dumpsys media.codec", 15_000)
-            CODEC_REGEX.findAll(codecs.stdout).forEach { add(it.value) }
-        }
-
-        val result = found.toList()
-        encoderCacheHost = currentHost
-        encoderCache = result
-        return result
-    }
-
-    suspend fun mediaInfo(): MediaInfo {
-        val output = adb.shell("dumpsys media_session; echo __UPTIME__; cat /proc/uptime", 20_000).stdout
-        val parts = output.split("__UPTIME__", limit = 2)
-        val text = parts[0]
-        val uptime = parts.getOrNull(1)?.trim()?.split(Regex("\\s+"))?.firstOrNull()?.toDoubleOrNull()
-
-        data class State(val state: Int, val position: Long, val speed: Double, val updated: Long)
-        val states = mutableListOf<State>()
-        PLAYBACK_LINE_REGEX.findAll(text).forEach { lineMatch ->
-            val line = lineMatch.value
-            val state = STATE_REGEX.find(line)?.groupValues?.get(1)?.toIntOrNull() ?: return@forEach
-            val position = POSITION_REGEX.find(line)?.groupValues?.get(1)?.toLongOrNull() ?: return@forEach
-            val speed = SPEED_REGEX.find(line)?.groupValues?.get(1)?.toDoubleOrNull() ?: 1.0
-            val updated = UPDATED_REGEX.find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-            states.add(State(state, position, speed, updated))
-        }
-        val chosen = states.firstOrNull { it.state == 3 } ?: states.firstOrNull()
-        var playing = false
-        var position = 0.0
-        if (chosen != null) {
-            playing = chosen.state == 3
-            position = maxOf(0L, chosen.position) / 1000.0
-            if (playing && uptime != null && chosen.updated > 0L) {
-                val nowMs = uptime * 1_000.0
-                val elapsed = (nowMs - chosen.updated) / 1_000.0
-                if (elapsed in 0.0..<600.0) position += elapsed * chosen.speed
-            }
-        }
-        val duration = DURATION_REGEX.find(text)?.groupValues?.get(1)?.toLongOrNull()
-            ?.div(1_000.0) ?: 0.0
-        val title = DESCRIPTION_REGEX.find(text)?.groupValues?.get(1)?.trim().orEmpty()
-        val packageName = PACKAGE_REGEX.find(text)?.groupValues?.get(1).orEmpty()
-        return MediaInfo(
-            playing = playing,
-            position = position,
-            duration = duration,
-            title = title,
-            packageName = packageName,
-        )
     }
 
     private fun resultOf(result: ShellResult): Result<Unit> {
@@ -272,21 +374,25 @@ class DeviceServices(private val adb: AdbManager) {
     }
 
     private companion object {
+        const val MAX_UNZIP_BYTES = 12 * 1024 * 1024
         val VOLUME_REGEX = Regex("""volume is (\d+) in range \[(\d+)\.\.(\d+)\]""")
-        val ENCODER_REGEX = Regex("""--video-codec=h264\s+--video-encoder=(\S+)""")
-        val CODEC_REGEX = Regex(
-            """\b(?:c2|OMX)\.[A-Za-z0-9_.-]*(?:avc|h264|264)[A-Za-z0-9_.-]*\b""",
-            RegexOption.IGNORE_CASE,
-        )
-        val PLAYBACK_LINE_REGEX = Regex("""PlaybackState \{[^\n]*""")
-        val STATE_REGEX = Regex("""state=(\d+)""")
-        val POSITION_REGEX = Regex("""(?<!buffered )position=(-?\d+)""")
-        val SPEED_REGEX = Regex("""speed=(-?[\d.]+)""")
-        val UPDATED_REGEX = Regex("""updated=(\d+)""")
-        val DURATION_REGEX = Regex("""(?:android\.media\.metadata\.DURATION|duration)=(\d+)""")
-        val DESCRIPTION_REGEX = Regex("""description=([^\n,]+)""")
-        val PACKAGE_REGEX = Regex("""package=([A-Za-z0-9_.]+)""")
+        val MEMORY_REGEX = Regex("""^(\w+):\s+(\d+)\s+kB""", RegexOption.MULTILINE)
     }
+}
+
+private fun splitOnce(text: String, marker: String): Pair<String, String> {
+    val index = text.indexOf(marker)
+    return if (index < 0) text to "" else text.substring(0, index) to text.substring(index + marker.length)
+}
+
+private fun parseDfKb(line: String): StorageStats? {
+    val parts = line.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+    if (parts.size < 5) return null
+    val total = parts[1].toLongOrNull() ?: return null
+    val used = parts[2].toLongOrNull() ?: return null
+    val available = parts[3].toLongOrNull() ?: return null
+    val percent = parts[4].removeSuffix("%").toFloatOrNull() ?: return null
+    return StorageStats(total * 1024L, used * 1024L, available * 1024L, percent)
 }
 
 private val PNG_MAGIC = byteArrayOf(

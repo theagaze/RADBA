@@ -20,15 +20,12 @@ private object Keys {
     val HOST = stringPreferencesKey("host")
     val DIM = intPreferencesKey("dim")
     val MIRROR = booleanPreferencesKey("mirror")
+    val AUDIO_PC = booleanPreferencesKey("audio_pc")
     val KB = booleanPreferencesKey("kb")
     val BASE_BRIGHTNESS = intPreferencesKey("base_brightness")
     val BASE_CONTRAST = intPreferencesKey("base_contrast")
     val BASE_SATURATION = intPreferencesKey("base_saturation")
     val ROOT_FIX_VIDEO = booleanPreferencesKey("root_fix_video")
-    val VIDEO_ENCODER = stringPreferencesKey("video_encoder")
-    val FPS_MODE = stringPreferencesKey("fps_mode")
-    val RES_MODE = stringPreferencesKey("res_mode")
-    val HW_ACCEL = booleanPreferencesKey("hwaccel")
     val V_BRIGHT = intPreferencesKey("v_bright")
     val V_WARM = intPreferencesKey("v_warm")
     val NIGHT_MODE = booleanPreferencesKey("night_mode")
@@ -37,8 +34,13 @@ private object Keys {
     val FAVORITES = stringSetPreferencesKey("favorites")
 }
 
-private val FPS_MODES = setOf("auto", "60", "30", "15")
-private val RES_MODES = setOf("nativa", "720", "480")
+/** Keys removed in RADB 0.2; they are dropped on the first write after migration. */
+private object LegacyKeys {
+    val VIDEO_ENCODER = stringPreferencesKey("video_encoder")
+    val FPS_MODE = stringPreferencesKey("fps_mode")
+    val RES_MODE = stringPreferencesKey("res_mode")
+    val HW_ACCEL = booleanPreferencesKey("hwaccel")
+}
 
 class AppPreferences(context: Context) {
     private val dataStore = context.applicationContext.radbaDataStore
@@ -56,13 +58,17 @@ class AppPreferences(context: Context) {
     }
 
     suspend fun setFavorites(values: Set<String>) {
-        dataStore.edit { it[Keys.FAVORITES] = values }
+        dataStore.edit {
+            it[Keys.FAVORITES] = values
+            dropLegacy(it)
+        }
     }
 
     private fun read(p: Preferences): Prefs = Prefs(
         host = p[Keys.HOST] ?: Prefs().host,
         dim = p[Keys.DIM] ?: Prefs().dim,
         mirror = p[Keys.MIRROR] ?: Prefs().mirror,
+        audioPc = p[Keys.AUDIO_PC] ?: Prefs().audioPc,
         kb = p[Keys.KB] ?: Prefs().kb,
         base = PictureBase(
             brightness = p[Keys.BASE_BRIGHTNESS] ?: 50,
@@ -70,10 +76,6 @@ class AppPreferences(context: Context) {
             saturation = p[Keys.BASE_SATURATION] ?: 50,
         ),
         rootFixVideo = p[Keys.ROOT_FIX_VIDEO] ?: Prefs().rootFixVideo,
-        videoEncoder = p[Keys.VIDEO_ENCODER] ?: Prefs().videoEncoder,
-        fpsMode = p[Keys.FPS_MODE] ?: Prefs().fpsMode,
-        resMode = p[Keys.RES_MODE] ?: Prefs().resMode,
-        hwaccel = p[Keys.HW_ACCEL] ?: Prefs().hwaccel,
         vBright = p[Keys.V_BRIGHT] ?: Prefs().vBright,
         vWarm = p[Keys.V_WARM] ?: Prefs().vWarm,
         nightMode = p[Keys.NIGHT_MODE] ?: Prefs().nightMode,
@@ -85,20 +87,25 @@ class AppPreferences(context: Context) {
         p[Keys.HOST] = prefs.host
         p[Keys.DIM] = prefs.dim
         p[Keys.MIRROR] = prefs.mirror
+        p[Keys.AUDIO_PC] = prefs.audioPc
         p[Keys.KB] = prefs.kb
         p[Keys.BASE_BRIGHTNESS] = prefs.base.brightness
         p[Keys.BASE_CONTRAST] = prefs.base.contrast
         p[Keys.BASE_SATURATION] = prefs.base.saturation
         p[Keys.ROOT_FIX_VIDEO] = prefs.rootFixVideo
-        p[Keys.VIDEO_ENCODER] = prefs.videoEncoder
-        p[Keys.FPS_MODE] = prefs.fpsMode
-        p[Keys.RES_MODE] = prefs.resMode
-        p[Keys.HW_ACCEL] = prefs.hwaccel
         p[Keys.V_BRIGHT] = prefs.vBright
         p[Keys.V_WARM] = prefs.vWarm
         p[Keys.NIGHT_MODE] = prefs.nightMode
         p[Keys.NIGHT_BRIGHT] = prefs.nightBright
         p[Keys.NIGHT_WARM] = prefs.nightWarm
+        dropLegacy(p)
+    }
+
+    private fun dropLegacy(p: MutablePreferences) {
+        p.remove(LegacyKeys.VIDEO_ENCODER)
+        p.remove(LegacyKeys.FPS_MODE)
+        p.remove(LegacyKeys.RES_MODE)
+        p.remove(LegacyKeys.HW_ACCEL)
     }
 
     private fun Prefs.validated(): Prefs = copy(
@@ -106,7 +113,5 @@ class AppPreferences(context: Context) {
         vWarm = vWarm.coerceIn(0, 100),
         nightBright = nightBright.coerceIn(10, 99),
         nightWarm = nightWarm.coerceIn(0, 100),
-        fpsMode = if (fpsMode in FPS_MODES) fpsMode else "auto",
-        resMode = if (resMode in RES_MODES) resMode else "720",
     )
 }

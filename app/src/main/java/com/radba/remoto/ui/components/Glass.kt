@@ -164,20 +164,21 @@ fun GlassButton(
         else -> GlassColors.text
     }
     GlassCard(
-        modifier = modifier.height(if (compact) 32.dp else 40.dp),
+        // Alvos de toque de pelo menos 44dp, confortáveis em telefone.
+        modifier = modifier.height(if (compact) 44.dp else 48.dp),
         onClick = if (enabled) onClick else null,
         accent = accent,
         corner = 50.dp,
         contentPadding = PaddingValues(
-            horizontal = if (compact) 6.dp else 14.dp,
-            vertical = 6.dp,
+            horizontal = if (compact) 10.dp else 14.dp,
+            vertical = 8.dp,
         ),
     ) {
         Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
             Text(
                 text = label,
                 color = if (enabled) textColor else GlassColors.sub,
-                fontSize = if (compact) 11.sp else 13.sp,
+                fontSize = if (compact) 12.sp else 14.sp,
                 fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
                 textAlign = TextAlign.Center,
                 maxLines = 1,
@@ -206,7 +207,7 @@ fun GlassToggle(
         Switch(
             checked = checked,
             onCheckedChange = { value -> runCatching { onCheckedChange(value) } },
-            modifier = Modifier.height(28.dp),
+            modifier = Modifier.height(48.dp),
             colors = SwitchDefaults.colors(
                 checkedThumbColor = GlassColors.bg,
                 checkedTrackColor = accent,
@@ -230,7 +231,7 @@ fun GlassSlider(
     Slider(
         value = value.coerceIn(valueRange.start, valueRange.endInclusive),
         onValueChange = { next -> runCatching { onValueChange(next) } },
-        modifier = modifier.height(30.dp),
+        modifier = modifier.height(44.dp),
         valueRange = valueRange,
         onValueChangeFinished = onValueChangeFinished?.let { callback ->
             { runCatching { callback() } }
@@ -305,7 +306,7 @@ fun ToastHost(toasts: Flow<ToastMessage>, modifier: Modifier = Modifier) {
             corner = 14.dp,
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
         ) {
-            Text(text = data.visuals.message, color = GlassColors.text, fontSize = 13.sp)
+            Text(text = data.visuals.message, color = GlassColors.text, fontSize = 14.sp)
         }
     }
 }

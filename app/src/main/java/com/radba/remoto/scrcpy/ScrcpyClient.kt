@@ -2,12 +2,14 @@ package com.radba.remoto.scrcpy
 
 import android.content.Context
 import android.media.MediaCodec
+import android.os.SystemClock
 import android.view.Surface
 import com.radba.remoto.adb.AdbManager
+import com.radba.remoto.data.MirrorStats
 import com.radba.remoto.data.Prefs
+import com.radba.remoto.data.VideoTier
+import com.radba.remoto.util.VIDEO_TIERS
 import com.radba.remoto.util.encoderPlan
-import com.radba.remoto.util.fpsServerValue
-import com.radba.remoto.util.resolutionProfile
 import io.github.muntashirakon.adb.AdbStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -63,8 +65,21 @@ class ScrcpyClient(
     val activeEncoder = MutableStateFlow("")
     val deviceSize = MutableStateFlow(0 to 0)
     val serverFps = MutableStateFlow(0)
+    val mirrorStats = MutableStateFlow(MirrorStats())
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    @Volatile private var tierIndex = 0
+
+    @Volatile private var lastPacketAtMs = 0L
+
+    @Volatile private var pipeMs = 0.0
+
+    @Volatile private var lastAdaptMs = 0L
+
+    @Volatile private var lowSinceMs = 0L
+
+    @Volatile private var goodSinceMs = 0L
 
     @Volatile private var generation = 0
 
@@ -134,18 +149,19 @@ class ScrcpyClient(
             if (prefs.rootFixVideo) applyRootFixes(onProgress)
             pushJarIfNeeded(jar, onProgress)
 
-            val plan = encoderPlan(prefs)
-            val baseFps = fpsServerValue(prefs.fpsMode)
+            val plan = encoderPlan()
+            val tier = currentTier()
             var lastReason = "Não foi possível iniciar o espelhamento"
 
             for ((index, candidate) in plan.withIndex()) {
                 if (token != generation) return false
                 val (encoder, software) = candidate
-                val fps = if (software) min(baseFps, 24) else baseFps
-                serverFps.value = fps
-                onProgress?.invoke("Tentativa ${index + 1}/${plan.size}: ${encoder ?: "hardware (padrão)"}")
+                serverFps.value = tier.maxFps
+                onProgress?.invoke(
+                    "${tier.name} · tentativa ${index + 1}/${plan.size}: ${encoder ?: "hardware (padrão)"}",
+                )
                 try {
-                    launchSession(token, prefs, encoder, software, fps, onProgress)
+                    launchSession(token, tier, encoder, onProgress)
                     if (token != generation) return false
                     activeEncoder.value = encoder ?: "hardware (padrão)"
                     error.value = ""
@@ -186,6 +202,66 @@ class ScrcpyClient(
         return !video.isClosed && !control.isClosed && controlJob?.isActive == true
     }
 
+    fun currentTier(): VideoTier = VIDEO_TIERS[tierIndex.coerceIn(VIDEO_TIERS.indices)]
+
+    fun resetTier() {
+        tierIndex = 0
+        mirrorStats.value = MirrorStats(currentTier().maxFps, 0, 0, currentTier().name)
+    }
+
+    /**
+     * Mirrors the adaptive logic of RADB 0.2: downgrade after sustained stalls,
+     * upgrade only after a long stable period. Returns -1/down, +1/up, 0/no change.
+     */
+    fun checkNetworkAdapt(): Int {
+        val decoder = decoder ?: return 0
+        val fps = decoder.fps(1_500L)
+        val lag = decoder.lagMs().toDouble()
+        pipeMs = if (pipeMs == 0.0) lag else pipeMs * 0.8 + lag * 0.2
+        val tier = currentTier()
+        mirrorStats.value = MirrorStats(
+            fps = fps.toInt(),
+            pipeMs = pipeMs.toInt(),
+            tier = tierIndex,
+            tierName = tier.name,
+        )
+        if (!isReady()) return 0
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastAdaptMs < ADAPT_COOLDOWN_MS) return 0
+
+        val rendered = decoder.lastRenderedAt()
+        val stall = lastPacketAtMs > 0L && rendered > 0L &&
+            (lastPacketAtMs - rendered) > STALL_MS && (now - lastPacketAtMs) < 2_000L
+        val highLatency = pipeMs > 75.0 && rendered > 0L && (now - rendered) < 1_000L
+
+        if (stall || highLatency) {
+            if (lowSinceMs == 0L) {
+                lowSinceMs = now
+            } else if (now - lowSinceMs >= 6_000L && tierIndex < VIDEO_TIERS.lastIndex) {
+                tierIndex++
+                lastAdaptMs = now
+                lowSinceMs = 0L
+                goodSinceMs = 0L
+                return -1
+            }
+        } else {
+            lowSinceMs = 0L
+            if (tierIndex > 0 && fps >= 28f && pipeMs < 20.0) {
+                if (goodSinceMs == 0L) {
+                    goodSinceMs = now
+                } else if (now - goodSinceMs >= 25_000L) {
+                    tierIndex--
+                    lastAdaptMs = now
+                    goodSinceMs = 0L
+                    return 1
+                }
+            } else {
+                goodSinceMs = 0L
+            }
+        }
+        return 0
+    }
+
     fun sendKey(code: Int): Boolean {
         if (!isReady()) return false
         val buffer = ByteBuffer.allocate(28).order(ByteOrder.BIG_ENDIAN)
@@ -206,12 +282,15 @@ class ScrcpyClient(
 
     fun sendText(text: String): Boolean {
         if (!isReady()) return false
-        val bytes = truncateUtf8(text, MAX_TEXT_BYTES)
-        val buffer = ByteBuffer.allocate(5 + bytes.size).order(ByteOrder.BIG_ENDIAN)
-        buffer.put(TYPE_TEXT.toByte())
-        buffer.putInt(bytes.size)
-        buffer.put(bytes)
-        return enqueue(buffer.array())
+        var sent = false
+        for (bytes in utf8Chunks(text, MAX_TEXT_BYTES)) {
+            val buffer = ByteBuffer.allocate(5 + bytes.size).order(ByteOrder.BIG_ENDIAN)
+            buffer.put(TYPE_TEXT.toByte())
+            buffer.putInt(bytes.size)
+            buffer.put(bytes)
+            sent = enqueue(buffer.array()) || sent
+        }
+        return sent
     }
 
     fun sendTouch(action: Int, x: Int, y: Int): Boolean {
@@ -248,7 +327,7 @@ class ScrcpyClient(
     /**
      * scrcpy 2.7 has no remote keyframe request on the control channel (type 17
      * is not part of the protocol and must never be sent). Instead, discard
-     * inter frames until the server's next keyframe (i-frame-interval=2).
+     * inter frames until the server's next keyframe (i-frame-interval=1).
      */
     fun requestKeyframe(): Boolean {
         if (!isReady()) return false
@@ -267,18 +346,22 @@ class ScrcpyClient(
 
     private suspend fun launchSession(
         token: Int,
-        prefs: Prefs,
+        tier: VideoTier,
         encoder: String?,
-        software: Boolean,
-        fps: Int,
         onProgress: ((String) -> Unit)?,
     ) {
+        lastPacketAtMs = 0L
+        pipeMs = 0.0
+        lastAdaptMs = SystemClock.elapsedRealtime()
+        lowSinceMs = 0L
+        goodSinceMs = 0L
+        mirrorStats.value = MirrorStats(tier.maxFps, 0, tierIndex, tier.name)
         // scrcpy parses scid with Integer.parseInt(value, 16), so it must be a
         // positive 31-bit value. Derive both the command and the socket name
         // from the same number so they always match.
         val scidValue = (UUID.randomUUID().mostSignificantBits and 0x7fff_ffffL).toInt()
         val scid = "%08x".format(scidValue)
-        val command = buildServerCommand(prefs, encoder, software, scid, fps)
+        val command = buildServerCommand(tier, encoder, scid)
         synchronized(logLock) { serverLog.setLength(0) }
         serverEnded = false
         ready = false
@@ -406,6 +489,7 @@ class ScrcpyClient(
                     }
                     val payload = ByteArray(size)
                     readFully(stream, payload, 0, size, token)
+                    lastPacketAtMs = SystemClock.elapsedRealtime()
                     val flags = when {
                         packedPts and CONFIG_FLAG != 0L -> MediaCodec.BUFFER_FLAG_CODEC_CONFIG
                         packedPts and KEY_FLAG != 0L -> MediaCodec.BUFFER_FLAG_KEY_FRAME
@@ -484,20 +568,27 @@ class ScrcpyClient(
         buffer.putInt(0)
     }
 
-    private fun truncateUtf8(text: String, maxBytes: Int): ByteArray {
-        val output = ByteArrayOutputStream()
+    private fun utf8Chunks(text: String, maxBytes: Int): List<ByteArray> {
+        val chunks = mutableListOf<ByteArray>()
+        var output = ByteArrayOutputStream()
         var index = 0
-        while (index < text.length && output.size() < maxBytes) {
+        while (index < text.length) {
             val current = text[index]
             val charLength = if (Character.isHighSurrogate(current) &&
                 index + 1 < text.length && Character.isLowSurrogate(text[index + 1])
             ) 2 else 1
             val encoded = text.substring(index, index + charLength).toByteArray(StandardCharsets.UTF_8)
-            if (output.size() + encoded.size > maxBytes) break
-            output.write(encoded, 0, encoded.size)
+            if (output.size() + encoded.size > maxBytes && output.size() > 0) {
+                chunks.add(output.toByteArray())
+                output = ByteArrayOutputStream()
+            }
+            if (encoded.size <= maxBytes) {
+                output.write(encoded, 0, encoded.size)
+            }
             index += charLength
         }
-        return output.toByteArray()
+        if (output.size() > 0) chunks.add(output.toByteArray())
+        return chunks
     }
 
     // ------------------------------------------------------------------
@@ -650,31 +741,19 @@ class ScrcpyClient(
         )
     }
 
-    private fun buildServerCommand(
-        prefs: Prefs,
-        encoder: String?,
-        software: Boolean,
-        scid: String,
-        fps: Int,
-    ): String {
-        val profile = resolutionProfile(prefs.resMode)
-        val maxSize = if (software) {
-            if (profile.maxSize <= 0) 960 else min(profile.maxSize, 960)
-        } else profile.maxSize
-        val bitrate = if (software) min(profile.bitrate, 4_000_000) else profile.bitrate
-
+    private fun buildServerCommand(tier: VideoTier, encoder: String?, scid: String): String {
         val command = StringBuilder(
             "CLASSPATH=$REMOTE_JAR app_process / com.genymobile.scrcpy.Server $SERVER_VERSION " +
                 "scid=$scid log_level=info tunnel_forward=true control=true video=true " +
-                "audio=false clipboard_autosync=false",
+                "audio=false cleanup=false clipboard_autosync=false",
         )
-        if (maxSize > 0) command.append(" max_size=").append(maxSize)
-        command.append(" max_fps=").append(fps)
-            .append(" video_bit_rate=").append(bitrate)
+        command.append(" max_size=").append(tier.maxSize)
+            .append(" max_fps=").append(tier.maxFps)
+            .append(" video_bit_rate=").append(tier.bitrate)
             .append(" video_codec=h264")
         if (!encoder.isNullOrBlank()) command.append(" video_encoder=").append(encoder)
         command.append(
-            " video_codec_options=i-frame-interval=2 send_frame_meta=true send_codec_meta=true " +
+            " video_codec_options=i-frame-interval=1 send_frame_meta=true send_codec_meta=true " +
                 "send_device_meta=true send_dummy_byte=true",
         )
         return command.toString()
@@ -743,7 +822,9 @@ class ScrcpyClient(
         const val STREAM_TIMEOUT_MS = 25_000L
         const val FIRST_FRAME_TIMEOUT_MS = 14_000L
         const val MAX_PACKET_SIZE = 64 * 1024 * 1024
-        const val MAX_TEXT_BYTES = 300
+        const val MAX_TEXT_BYTES = 260
+        const val ADAPT_COOLDOWN_MS = 8_000L
+        const val STALL_MS = 2_800L
         const val TYPE_KEY = 0
         const val TYPE_TEXT = 1
         const val TYPE_TOUCH = 2
