@@ -971,7 +971,7 @@ class ScrcpyClient(
         if (!ctlStarting.compareAndSet(false, true)) return false
         val token = ++ctlGeneration
         try {
-            adb.withCritical {
+            val started = adb.withCritical {
                 teardownControl()
                 prepareAndPushJar(null)
                 val scid = "%08x".format((UUID.randomUUID().mostSignificantBits and 0x7fff_ffffL).toInt())
@@ -1027,12 +1027,14 @@ class ScrcpyClient(
                 if (token != ctlGeneration || !adb.online.value || ctlJob?.isActive != true) {
                     closeStream(control)
                     teardownControl()
-                    return@withCritical false
+                    false
+                } else {
+                    ctlStream = control
+                    ctlReady = true
+                    true
                 }
-                ctlStream = control
-                ctlReady = true
-                return@withCritical true
             }
+            return started
         } catch (t: Throwable) {
             teardownControl()
             if (t is CancellationException) throw t
